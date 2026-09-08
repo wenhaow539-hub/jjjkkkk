@@ -1,3 +1,15 @@
-2026/09/08-14:58:09.851 3c14 Reusing MANIFEST C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Local Storage\leveldb/MANIFEST-000001
-2026/09/08-14:58:09.854 3c14 Recovering log #26
-2026/09/08-14:58:09.855 3c14 Reusing old log C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Local Storage\leveldb/000026.log 
+2026/09/08-16:03:20.055 36bc Reusing MANIFEST C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Local Storage\leveldb/MANIFEST-000001
+2026/09/08-16:03:20.058 36bc Recovering log #35
+2026/09/08-16:03:20.059 36bc Reusing old log C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Local Storage\leveldb/000035.log 
+2026/09/08-16:04:07.527 38f4 Level-0 table #39: started
+2026/09/08-16:04:07.528 38f4 Level-0 table #39: 40597 bytes OK
+2026/09/08-16:04:07.529 38f4 Delete type=0 #35
+2026/09/08-16:04:07.529 36bc Compacting 4@0 + 1@1 files
+2026/09/08-16:04:07.533 36bc Generated table #40@0: 266 keys, 341794 bytes
+2026/09/08-16:04:07.533 36bc Compacted 4@0 + 1@1 files => 341794 bytes
+2026/09/08-16:04:07.533 36bc compacted to: files[ 0 1 0 0 0 0 0 ]
+2026/09/08-16:04:07.534 36bc Delete type=2 #27
+2026/09/08-16:04:07.534 36bc Delete type=2 #30
+2026/09/08-16:04:07.534 36bc Delete type=2 #33
+2026/09/08-16:04:07.534 36bc Delete type=2 #36
+2026/09/08-16:04:07.534 36bc Delete type=2 #39

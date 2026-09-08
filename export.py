@@ -5,11 +5,12 @@ from evaluator import QualifiedLead
 
 
 def append_lead_to_excel(lead: QualifiedLead, file_path: str):
-    """追加线索到 Excel，包含独立官网与公安备案列"""
+    """追加线索到 Excel，第 1 列标明数据来源"""
     headers = [
+        "数据来源",
         "平台展示名称",
-        "法定注册公司",
-        "公司注册地址",
+        "法定注册公司(Registered Company)",
+        "公司注册地址(Company Registration Address)",
         "联系人",
         "联系人职位",
         "独立官网",
@@ -37,6 +38,7 @@ def append_lead_to_excel(lead: QualifiedLead, file_path: str):
             ws.append(headers)
 
     ws.append([
+        lead.data_source or "Global Sources",
         lead.company_name,
         lead.registered_company or "未找到",
         lead.registered_address or "未找到",
@@ -52,12 +54,12 @@ def append_lead_to_excel(lead: QualifiedLead, file_path: str):
 
     try:
         wb.save(target_path)
-        print(f"✅ [成功入库] {lead.company_name}")
+        print(f"✅ [成功入库] [{lead.data_source}] {lead.company_name}")
         print(f"   ├─ 法定公司: {lead.registered_company}")
         print(f"   ├─ 注册地址: {lead.registered_address}")
         print(f"   ├─ 联系人: {lead.contact_person} ({lead.contact_title})")
         print(f"   ├─ 独立官网: {lead.official_website or '未找到'}")
-        print(f"   └─ 公安备案: {lead.police_record}")
+        print(f"   └─ 网站备案: {lead.police_record}")
     except PermissionError:
         backup_path = f"target_leads_{int(time.time())}.xlsx"
         wb.save(backup_path)
