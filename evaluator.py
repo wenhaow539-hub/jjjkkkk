@@ -7,12 +7,16 @@ from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
 client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
 
-# 所有字段均设为可空（Optional）并赋予默认安全值
 class QualifiedLead(BaseModel):
-    company_name: str = Field(default="未知公司", description="公司或商户全称")
+    company_name: str = Field(default="未知公司", description="平台展示名称")
+    registered_company: Optional[str] = Field(default="未找到",
+                                              description="官方 Registered Company 法定注册公司名称/中文名")
+    registered_address: Optional[str] = Field(default="未找到",
+                                              description="官方 Company Registration Address 公司注册地址")
+    contact_person: Optional[str] = Field(default="未找到", description="联系人姓名")
+    contact_title: Optional[str] = Field(default="未找到", description="联系人职位")
     official_website: Optional[str] = Field(default=None, description="公司独立官网")
-    contact_email: Optional[str] = Field(default=None, description="联系邮箱")
-    contact_phone: Optional[str] = Field(default=None, description="联系电话/WhatsApp")
+    police_record: Optional[str] = Field(default="无", description="独立官网公安网安备案情况")
     main_products: Optional[str] = Field(default="未提及", description="核心主营产品或品类")
     score: Optional[int] = Field(default=0, description="客户价值匹配度评分(0-100)")
     is_target: Optional[bool] = Field(default=False, description="是否属于目标潜在客户(True/False)")
@@ -21,17 +25,20 @@ class QualifiedLead(BaseModel):
 
 def analyze_and_screen_lead(company_name: str, raw_text: str, target_criteria: str) -> QualifiedLead:
     system_prompt = f"""
-你是一名经验丰富的跨境出海外贸分析师。
-你的任务是评估目标公司是否符合我们的【客户画像标准】：
+你是一名资深的跨境出海外贸分析师。
+你的任务是核对目标供应商信息，并严格对照【客户画像标准】进行打分：
 {target_criteria}
 
-请严格按以下 JSON 字段结构返回，所有键必须保留。若某项未找到，直接填 null，严禁编造：
+请严格按 JSON 格式返回，未知项填 null：
 {{
   "company_name": "{company_name}",
+  "registered_company": "中文注册公司全称",
+  "registered_address": "详细注册地址",
+  "contact_person": "联系人姓名",
+  "contact_title": "联系人职位",
   "official_website": null,
-  "contact_email": null,
-  "contact_phone": null,
-  "main_products": "根据资料总结其主营产品",
+  "police_record": "无",
+  "main_products": "主营品类",
   "score": 85,
   "is_target": true,
   "review_reason": "判定合格或淘汰的核心原因"
@@ -40,8 +47,8 @@ def analyze_and_screen_lead(company_name: str, raw_text: str, target_criteria: s
 
     user_content = f"""
 【目标公司】：{company_name}
-【收集到的网页与背景资料】：
-{raw_text if raw_text.strip() else "暂无外部反查资料，请基于公司名及展示产品进行评估。"}
+【深度背景与官方主页资料】：
+{raw_text if raw_text.strip() else "暂无资料，请基于公司名常识评估。"}
 """
 
     try:
@@ -57,8 +64,17 @@ def analyze_and_screen_lead(company_name: str, raw_text: str, target_criteria: s
 
         data = json.loads(response.choices[0].message.content)
 
-        # 强制数据预清洗，彻底消除任何 None 导致的不兼容
         data["company_name"] = data.get("company_name") or company_name
+        if not data.get("registered_company"):
+            data["registered_company"] = "未找到"
+        if not data.get("registered_address"):
+            data["registered_address"] = "未找到"
+        if not data.get("contact_person"):
+            data["contact_person"] = "未找到"
+        if not data.get("contact_title"):
+            data["contact_title"] = "未找到"
+        if not data.get("police_record"):
+            data["police_record"] = "无"
         if not data.get("main_products"):
             data["main_products"] = "根据主营名称评估"
         if data.get("score") is None:
@@ -72,6 +88,11 @@ def analyze_and_screen_lead(company_name: str, raw_text: str, target_criteria: s
         print(f"⚠️ 模型返回解析异常: {e}，启用基础兜底。")
         return QualifiedLead(
             company_name=company_name,
+            registered_company="未找到",
+            registered_address="未找到",
+            contact_person="未找到",
+            contact_title="未找到",
+            police_record="无",
             main_products="自动识别",
             score=50,
             is_target=True,

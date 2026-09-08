@@ -6,99 +6,253 @@ from config import USER_DATA_DIR
 
 
 def is_valid_company_name(name: str) -> bool:
-    """严格过滤年限、国别、纯数字及非公司杂质标签"""
     name = name.strip()
-    # 长度过短直接过滤
-    if len(name) < 6:
+    if len(name) < 6 or len(name) > 80:
         return False
-    # 过滤 "1年 CN", "19 yrs CN" 等年限标识
-    if re.search(r'^\d+\s*(年|yr|yrs|year|years)', name, re.I):
+    invalid_keywords = [
+        "verified", "supplier", "inquire", "chat", "contact",
+        "manufacturer", "video", "exhibitor", "years", "global sources"
+    ]
+    if name.lower() in invalid_keywords:
         return False
-    # 过滤只有几个字符带国别后缀的徽章（如 "5 YRS CN"）
-    if re.search(r'\b(CN|HK|TW|US)\b$', name) and len(name) < 15:
-        return False
-    # 过滤常见平台操作词
-    invalid_words = ["contact supplier", "chat now", "supplier", "inquiry", "follow"]
-    if name.lower() in invalid_words:
-        return False
-    return True
+    return bool(re.search(
+        r'\b(co\.|ltd|limited|corp|inc|technology|electronics|industrial|electric|lighting|optoelectronic|trade|display)\b',
+        name, re.I))
 
 
-async def scrape_alibaba_suppliers(keyword: str, max_count: int = 5) -> list[dict]:
-    search_url = f"https://www.alibaba.com/trade/search?SearchText={quote_plus(keyword)}"
-    results = []
+def format_clean_url(href: str) -> str:
+    if not href:
+        return ""
+    href = href.strip()
+    if href.startswith("//"):
+        return f"https:{href}"
+    elif href.startswith("/"):
+        return f"https://www.globalsources.com{href}"
+    elif not href.startswith("http"):
+        return f"https://www.globalsources.com/{href}"
+    return href
+
+
+def clean_token(val: str) -> str:
+    if not val:
+        return ""
+    val = re.sub(r'[\r\n\t]+', ' ', val).strip()
+    bad_tokens = ["send inquiry", "inquiry now", "chat now", "inquire", "contact supplier", "verified", "view more",
+                  "view less"]
+    for b in bad_tokens:
+        if b in val.lower():
+            return ""
+    return val
+
+
+def normalize_website(url: str) -> str:
+    """标准化独立官网 URL"""
+    if not url:
+        return ""
+    url = url.strip()
+    if "globalsources.com" in url.lower():
+        return ""
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = f"https://{url}"
+    return url
+
+
+async def scrape_supplier_profile_detail(page, store_url: str) -> dict:
+    """双页面穿透：提取工商认证、联系人、职位及企业独立官网"""
+    info = {
+        "registered_company": "",
+        "registered_address": "",
+        "contact_person": "",
+        "contact_title": "",
+        "official_website": "",
+        "full_text": ""
+    }
+    if not store_url or not store_url.startswith("http"):
+        return info
+
+    profile_url = re.sub(r'/(homepage|contact-us)_', '/company-profile_', store_url)
+    contact_url = re.sub(r'/(homepage|company-profile)_', '/contact-us_', store_url)
+
+    # ==================== 1. 访问【Company Profile】提取工商信息 ====================
+    print(f"      🏢 [1/2] 访问企业工商档案: {profile_url}")
+    try:
+        await page.goto(profile_url, wait_until="domcontentloaded", timeout=40000)
+        await page.wait_for_timeout(2000)
+        await page.mouse.wheel(0, 1000)
+        await page.wait_for_timeout(1500)
+
+        biz_data = await page.evaluate("""
+            () => {
+                let comp = "";
+                let addr = "";
+                const bodyText = document.body.innerText || "";
+
+                const compMatch = bodyText.match(/Registered\\s*Company\\s*[:：]?\\s*([\\s\\S]*?)(?:Registration\\s*Number|Company\\s*Registration Address)/i);
+                if (compMatch) {
+                    const lines = compMatch[1].split('\\n').map(s => s.trim()).filter(Boolean);
+                    if (lines.length > 0) comp = lines[0];
+                }
+
+                const addrMatch = bodyText.match(/(?:Company\\s*Registration\\s*Address|Registered\\s*Address)\\s*[:：]?\\s*([\\s\\S]*?)(?:\\*\\s*In\\s*China|View\\s*Less|Production\\s*Capacity|\\n\\n)/i);
+                if (addrMatch) {
+                    const lines = addrMatch[1].split('\\n').map(s => s.trim()).filter(Boolean);
+                    if (lines.length > 0) addr = lines[0];
+                }
+
+                return { comp, addr, rawText: bodyText.slice(0, 2000) };
+            }
+        """)
+
+        info["registered_company"] = clean_token(biz_data.get("comp", ""))
+        info["registered_address"] = clean_token(biz_data.get("addr", ""))
+        info["full_text"] = biz_data.get("rawText", "")
+
+        if info["registered_company"]:
+            print(f"      📌 [抓取成功] Registered Company: {info['registered_company']}")
+        if info["registered_address"]:
+            print(f"      📌 [抓取成功] Company Registration Address: {info['registered_address']}")
+
+    except Exception as e:
+        print(f"      ⚠️ 工商档案页提取异常: {e}")
+
+    # ==================== 2. 访问【Contact Us】提取联系人、职位与独立官网 ====================
+    print(f"      👤 [2/2] 访问联系人档案: {contact_url}")
+    try:
+        await page.goto(contact_url, wait_until="domcontentloaded", timeout=40000)
+        await page.wait_for_timeout(2500)
+
+        contact_data = await page.evaluate("""
+            () => {
+                let person = "";
+                let title = "";
+                let fallbackAddr = "";
+                let officialWebsite = "";
+
+                // 1. 精准提取联系人与职位
+                const nameEl = document.querySelector('.contact-name');
+                const workerEl = document.querySelector('.contact-worker');
+                if (nameEl) person = nameEl.innerText.replace(/\\s+/g, ' ').trim();
+                if (workerEl) title = workerEl.innerText.replace(/\\s+/g, ' ').trim();
+
+                // 2. 精准提取 Other homepage website 独立官网
+                const items = document.querySelectorAll('.contact-item');
+                for (const it of items) {
+                    const label = it.querySelector('.contact-label')?.innerText || "";
+                    const val = it.querySelector('.contact-value')?.innerText || "";
+                    if (/Other\\s+homepage\\s+website/i.test(label) && val) {
+                        officialWebsite = val.trim();
+                        break;
+                    }
+                }
+
+                // 备用正则扫描官网
+                const bodyText = document.body.innerText || "";
+                if (!officialWebsite) {
+                    const mSite = bodyText.match(/Other\\s+homepage\\s+website\\s*[:：]?\\s*([a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})/i);
+                    if (mSite) officialWebsite = mSite[1].trim();
+                }
+
+                // 提取备用地址
+                const mAddr = bodyText.match(/Address\\s*[:：]?\\s*([^\\n\\r]+)/i);
+                if (mAddr) fallbackAddr = mAddr[1].trim();
+
+                return { person, title, officialWebsite, fallbackAddr };
+            }
+        """)
+
+        info["contact_person"] = clean_token(contact_data.get("person", ""))
+        info["contact_title"] = clean_token(contact_data.get("title", ""))
+        info["official_website"] = normalize_website(contact_data.get("officialWebsite", ""))
+
+        if not info["registered_address"] and contact_data.get("fallbackAddr"):
+            info["registered_address"] = clean_token(contact_data.get("fallbackAddr"))
+
+        if info["contact_person"]:
+            print(f"      👤 [抓取成功] 联系人: {info['contact_person']} | 职位: {info['contact_title'] or '未注明'}")
+        if info["official_website"]:
+            print(f"      🌐 [抓取成功] 独立企业官网: {info['official_website']}")
+
+    except Exception as e:
+        print(f"      ⚠️ 联系人页提取异常: {e}")
+
+    return info
+
+
+async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 5) -> list[dict]:
+    clean_kw = keyword.lower().replace("manufacturer", "").strip()
+    search_url = f"https://www.globalsources.com/searchList/suppliers?keyWord={quote_plus(clean_kw)}&pageNum=1"
+
+    candidate_sellers = []
+    final_results = []
+    seen_companies = set()
 
     async with async_playwright() as p:
-        print("🌐 启动自动化浏览器...")
+        print("🌐 启动 Chrome 自动化浏览器...")
+
         context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
+            channel="chrome",
             headless=False,
+            proxy={"server": "http://127.0.0.1:7897"},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            ignore_https_errors=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--start-maximized"
+                "--start-maximized",
+                "--no-sandbox"
             ],
             viewport=None
         )
 
         page = context.pages[0] if context.pages else await context.new_page()
-        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
 
-        print(f"🔗 正在导航至搜索页: {search_url}")
+        print(f"🔗 正在检索商户列表: {search_url}")
         await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(4000)
 
-        # 1. 检测是否触发反爬/安全验证页
-        current_url = page.url
-        if "punish" in current_url or "sec.alibaba.com" in current_url or "captcha" in current_url:
-            print("\n🚨 检测到阿里滑块验证码拦截！")
-            print("👉 请在弹出的浏览器窗口中手动完成滑块/拼图验证（程序将等待最多 30 秒）...\n")
-            for _ in range(30):
-                await page.wait_for_timeout(1000)
-                if "punish" not in page.url and "sec.alibaba.com" not in page.url:
-                    print("✅ 验证通过，继续解析数据！")
-                    break
-        else:
-            await page.wait_for_timeout(3000)
-
-        # 2. 模拟向下滚动加载异步卡片
-        print("📜 正在滚动加载页面列表...")
-        for _ in range(3):
+        for _ in range(4):
             await page.mouse.wheel(0, 800)
             await page.wait_for_timeout(1000)
 
-        # 3. 使用覆盖面最广的链接级选择器定位供应商
-        elements = await page.query_selector_all('a[href*="company_profile.html"], a.search-card-e-company')
-        print(f"📦 匹配到 {len(elements)} 个候选商户节点，开始筛选...")
-
-        seen_companies = set()
-        for el in elements:
-            if len(results) >= max_count:
+        all_links = await page.query_selector_all("a")
+        for a in all_links:
+            if len(candidate_sellers) >= max_count:
                 break
+            text = (await a.inner_text()).strip()
+            href = await a.get_attribute("href") or ""
 
-            # 获取公司名称（优先取 title 属性，避免读到内部徽章小字）
-            name = await el.get_attribute("title")
-            if not name:
-                name = await el.inner_text()
+            if is_valid_company_name(text) and text not in seen_companies and href:
+                seen_companies.add(text)
+                candidate_sellers.append({
+                    "company": text,
+                    "store_url": format_clean_url(href)
+                })
 
-            # 清理换行符
-            name = name.split("\n")[0].strip()
+        print(f"📦 一级搜索完成，锁定 {len(candidate_sellers)} 家待深入穿透的供应商！\n")
 
-            # 校验是否为合法公司名
-            if not is_valid_company_name(name) or name in seen_companies:
-                continue
+        for idx, seller in enumerate(candidate_sellers, 1):
+            comp_name = seller["company"]
+            store_url = seller["store_url"]
+            print(f"🔍 [{idx}/{len(candidate_sellers)}] 深入挖掘: {comp_name}")
 
-            link = await el.get_attribute("href") or ""
-            if link and not link.startswith("http"):
-                link = f"https:{link}"
+            detail_info = await scrape_supplier_profile_detail(page, store_url)
 
-            seen_companies.add(name)
-            results.append({
-                "company": name,
-                "platform": "Alibaba",
-                "store_url": link,
-                "card_product": keyword  # 保底以搜索关键词作为主营品类参考
+            final_results.append({
+                "company": comp_name,
+                "platform": "GlobalSources",
+                "store_url": store_url,
+                "registered_company": detail_info["registered_company"],
+                "registered_address": detail_info["registered_address"],
+                "contact_person": detail_info["contact_person"],
+                "contact_title": detail_info["contact_title"],
+                "official_website": detail_info["official_website"],
+                "detail_content": detail_info["full_text"],
+                "card_product": clean_kw
             })
+            await page.wait_for_timeout(1500)
 
         await context.close()
 
-    print(f"🎯 成功采集到 {len(results)} 家有效供应商！")
-    return results
+    print(f"\n🎯 深度采集完毕，共获取 {len(final_results)} 家供应商！")
+    return final_results

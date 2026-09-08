@@ -1,5 +1,3 @@
-2026/09/08-00:00:34.177 24914 Reusing MANIFEST D:\Python-Project\lead_agent\chrome_user_data\Default\Local Storage\leveldb/MANIFEST-000001
-2026/09/08-00:00:34.182 24914 Recovering log #7
-2026/09/08-00:00:34.184 24914 Reusing old log D:\Python-Project\lead_agent\chrome_user_data\Default\Local Storage\leveldb/000007.log 
-2026/09/08-00:00:43.484 21b78 Level-0 table #10: started
-2026/09/08-00:00:43.496 21b78 Level-0 table #10: 17217 bytes OK
+2026/09/08-15:13:39.913 35e8 Reusing MANIFEST C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Local Storage\leveldb/MANIFEST-000001
+2026/09/08-15:13:39.916 35e8 Recovering log #26
+2026/09/08-15:13:39.917 35e8 Reusing old log C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Local Storage\leveldb/000026.log 
