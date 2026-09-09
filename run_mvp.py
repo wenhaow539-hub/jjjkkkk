@@ -14,7 +14,7 @@ TARGET_CRITERIA = """
 
 async def main():
     SEARCH_KEYWORD = "monitor"
-    SCRAPE_LIMIT = 5
+    SCRAPE_LIMIT = 10
 
     print(f"🚀 启动环球资源深度寻客 Agent（关键词: {SEARCH_KEYWORD}）...")
     sellers = await scrape_globalsources_suppliers(keyword=SEARCH_KEYWORD, max_count=SCRAPE_LIMIT)

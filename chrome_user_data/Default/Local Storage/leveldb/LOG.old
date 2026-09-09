@@ -1,15 +1,18 @@
-2026/09/08-16:03:20.055 36bc Reusing MANIFEST C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Local Storage\leveldb/MANIFEST-000001
-2026/09/08-16:03:20.058 36bc Recovering log #35
-2026/09/08-16:03:20.059 36bc Reusing old log C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Local Storage\leveldb/000035.log 
-2026/09/08-16:04:07.527 38f4 Level-0 table #39: started
-2026/09/08-16:04:07.528 38f4 Level-0 table #39: 40597 bytes OK
-2026/09/08-16:04:07.529 38f4 Delete type=0 #35
-2026/09/08-16:04:07.529 36bc Compacting 4@0 + 1@1 files
-2026/09/08-16:04:07.533 36bc Generated table #40@0: 266 keys, 341794 bytes
-2026/09/08-16:04:07.533 36bc Compacted 4@0 + 1@1 files => 341794 bytes
-2026/09/08-16:04:07.533 36bc compacted to: files[ 0 1 0 0 0 0 0 ]
-2026/09/08-16:04:07.534 36bc Delete type=2 #27
-2026/09/08-16:04:07.534 36bc Delete type=2 #30
-2026/09/08-16:04:07.534 36bc Delete type=2 #33
-2026/09/08-16:04:07.534 36bc Delete type=2 #36
-2026/09/08-16:04:07.534 36bc Delete type=2 #39
+2026/09/09-09:43:12.734 758 Reusing MANIFEST C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Local Storage\leveldb/MANIFEST-000001
+2026/09/09-09:43:12.737 758 Recovering log #48
+2026/09/09-09:43:12.738 758 Reusing old log C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Local Storage\leveldb/000048.log 
+2026/09/09-09:43:29.176 1c54 Level-0 table #51: started
+2026/09/09-09:43:29.181 1c54 Level-0 table #51: 44187 bytes OK
+2026/09/09-09:43:29.183 1c54 Delete type=0 #48
+2026/09/09-09:43:29.183 758 Compacting 4@0 + 1@1 files
+2026/09/09-09:43:29.204 758 Generated table #52@0: 269 keys, 339130 bytes
+2026/09/09-09:43:29.204 758 Compacted 4@0 + 1@1 files => 339130 bytes
+2026/09/09-09:43:29.205 758 compacted to: files[ 0 1 0 0 0 0 0 ]
+2026/09/09-09:43:29.205 758 Delete type=2 #40
+2026/09/09-09:43:29.205 758 Delete type=2 #43
+2026/09/09-09:43:29.205 758 Delete type=2 #46
+2026/09/09-09:43:29.205 758 Delete type=2 #48
+2026/09/09-09:43:29.205 758 Delete type=2 #51
+2026/09/09-09:46:26.243 1c54 Level-0 table #54: started
+2026/09/09-09:46:26.247 1c54 Level-0 table #54: 50419 bytes OK
+2026/09/09-09:46:26.249 1c54 Delete type=0 #50

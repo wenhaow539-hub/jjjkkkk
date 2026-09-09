@@ -1,2 +1,5 @@
-2026/09/08-16:27:06.801 3f3c Creating DB C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Session Storage since it was missing.
-2026/09/08-16:27:06.811 3f3c Reusing MANIFEST C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Session Storage/MANIFEST-000001
+2026/09/09-09:51:20.741 257c Creating DB C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Session Storage since it was missing.
+2026/09/09-09:51:20.753 257c Reusing MANIFEST C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Session Storage/MANIFEST-000001
+2026/09/09-09:55:17.539 1dfc Level-0 table #5: started
+2026/09/09-09:55:17.544 1dfc Level-0 table #5: 16968 bytes OK
+2026/09/09-09:55:17.545 1dfc Delete type=0 #3

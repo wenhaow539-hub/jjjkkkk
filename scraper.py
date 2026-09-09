@@ -1,4 +1,6 @@
 import asyncio
+import os
+import random
 import re
 from urllib.parse import quote_plus
 from playwright.async_api import async_playwright
@@ -42,8 +44,10 @@ def clean_token(val: str) -> str:
     if not val:
         return ""
     val = re.sub(r'[\r\n\t]+', ' ', val).strip()
-    bad_tokens = ["send inquiry", "inquiry now", "chat now", "inquire", "contact supplier", "verified", "view more",
-                  "view less"]
+    bad_tokens = [
+        "send inquiry", "inquiry now", "chat now", "inquire",
+        "contact supplier", "verified", "view more", "view less"
+    ]
     for b in bad_tokens:
         if b in val.lower():
             return ""
@@ -61,21 +65,27 @@ def normalize_website(url: str) -> str:
     return url
 
 
-async def safe_navigate(page, url: str, timeout: int = 35000) -> bool:
-    """安全导航函数：防打断、重置错误页状态"""
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-        await page.wait_for_timeout(1500)
-        return True
-    except Exception as e:
-        print(f"      ⚠️ 页面加载受阻，正在重试: {url.split('/')[-1]} ({e})")
+async def safe_navigate(page, url: str, timeout: int = 35000, max_retries: int = 3) -> bool:
+    """安全导航函数：自动捕获 Too much connections 限流并退避冷却重试"""
+    for attempt in range(1, max_retries + 1):
         try:
-            await page.wait_for_timeout(1000)
-            await page.goto(url, wait_until="commit", timeout=20000)
-            await page.wait_for_timeout(1500)
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            await page.wait_for_timeout(random.randint(1800, 3000))
+
+            # 检测是否触发服务端频控
+            body_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+            if "Too much connections" in body_text:
+                cooldown = random.randint(15, 25)
+                print(f"      ⏳ [触发服务端限流] 命中 Too much connections，冷却 {cooldown} 秒后重试 (第 {attempt}/{max_retries} 次)...")
+                await asyncio.sleep(cooldown)
+                continue
+
             return True
-        except Exception:
-            return False
+        except Exception as e:
+            print(f"      ⚠️ 页面加载受阻 (尝试 {attempt}/{max_retries}): {url.split('/')[-1]} ({e})")
+            await asyncio.sleep(random.randint(3, 6))
+
+    return False
 
 
 async def scrape_supplier_profile_detail(page, store_url: str) -> dict:
@@ -86,6 +96,7 @@ async def scrape_supplier_profile_detail(page, store_url: str) -> dict:
         "contact_person": "",
         "contact_title": "",
         "official_website": "",
+        "phone": "",
         "raw_products": "",
         "full_text": ""
     }
@@ -131,13 +142,27 @@ async def scrape_supplier_profile_detail(page, store_url: str) -> dict:
         except Exception as e:
             print(f"      ⚠️ 工商档案解析异常: {e}")
 
+    # 子页面缓冲，降低单域名请求频次
+    await asyncio.sleep(random.uniform(2.0, 3.5))
+
     # ==================== 2. 访问【Contact Us】====================
     print(f"      👤 [2/3] 访问联系人档案: {contact_url}")
     if await safe_navigate(page, contact_url):
         try:
+            try:
+                view_more_buttons = await page.query_selector_all('button:has-text("View More"), a:has-text("View More"), [class*="view-more"]')
+                for btn in view_more_buttons:
+                    if await btn.is_visible():
+                        await btn.click()
+                        await page.wait_for_timeout(800)
+            except Exception:
+                pass
+
             contact_data = await page.evaluate("""
                 () => {
                     let person = "", title = "", fallbackAddr = "", officialWebsite = "";
+                    let phoneList = [];
+
                     const nameEl = document.querySelector('.contact-name');
                     const workerEl = document.querySelector('.contact-worker');
                     if (nameEl) person = nameEl.innerText.replace(/\\s+/g, ' ').trim();
@@ -149,30 +174,54 @@ async def scrape_supplier_profile_detail(page, store_url: str) -> dict:
                         const val = it.querySelector('.contact-value')?.innerText || "";
                         if (/Other\\s+homepage\\s+website/i.test(label) && val) {
                             officialWebsite = val.trim();
-                            break;
+                        }
+                        if (/(?:Telephone|Mobile\\s*Phone|Phone|Fax)/i.test(label) && val) {
+                            const cleanVal = val.replace(/view\\s*more/ig, '').trim();
+                            if (cleanVal && !phoneList.includes(cleanVal)) {
+                                phoneList.push(cleanVal);
+                            }
                         }
                     }
+
                     const bodyText = document.body.innerText || "";
+                    if (phoneList.length === 0) {
+                        const mPhone = bodyText.match(/(?:Telephone|Mobile\\s*Phone)\\s*[:：]?\\s*([+\\d\\s-]{7,25})/i);
+                        if (mPhone && !/view/i.test(mPhone[1])) {
+                            phoneList.push(mPhone[1].trim());
+                        }
+                    }
+
                     const mAddr = bodyText.match(/Address\\s*[:：]?\\s*([^\\n\\r]+)/i);
                     if (mAddr) fallbackAddr = mAddr[1].trim();
 
-                    return { person, title, officialWebsite, fallbackAddr };
+                    return {
+                        person,
+                        title,
+                        officialWebsite,
+                        fallbackAddr,
+                        phone: phoneList.join(" / ")
+                    };
                 }
             """)
             info["contact_person"] = clean_token(contact_data.get("person", ""))
             info["contact_title"] = clean_token(contact_data.get("title", ""))
             info["official_website"] = normalize_website(contact_data.get("officialWebsite", ""))
+            info["phone"] = clean_token(contact_data.get("phone", ""))
 
             if not info["registered_address"] and contact_data.get("fallbackAddr"):
                 info["registered_address"] = clean_token(contact_data.get("fallbackAddr"))
 
             if info["contact_person"]:
-                print(
-                    f"      👤 [抓取成功] 联系人: {info['contact_person']} | 职位: {info['contact_title'] or '未注明'}")
+                print(f"      👤 [抓取成功] 联系人: {info['contact_person']} | 职位: {info['contact_title'] or '未注明'}")
+            if info["phone"]:
+                print(f"      📞 [解掩码成功] 真实联系电话: {info['phone']}")
             if info["official_website"]:
                 print(f"      🌐 [抓取成功] 独立企业官网: {info['official_website']}")
         except Exception as e:
             print(f"      ⚠️ 联系人页解析异常: {e}")
+
+    # 子页面缓冲
+    await asyncio.sleep(random.uniform(2.0, 3.5))
 
     # ==================== 3. 访问【Showroom】====================
     print(f"      📦 [3/3] 访问产品展厅: {showroom_url}")
@@ -209,7 +258,7 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
     seen_companies = set()
 
     async with async_playwright() as p:
-        print("🌐 启动 Chrome 自动化浏览器...")
+        print(f"🌐 启动自动化 Chrome 浏览器 (档案路径: {USER_DATA_DIR})...")
 
         context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
@@ -220,8 +269,7 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
             ignore_https_errors=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--start-maximized",
-                "--no-sandbox"
+                "--start-maximized"
             ],
             viewport=None
         )
@@ -229,11 +277,26 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
         page = context.pages[0] if context.pages else await context.new_page()
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
 
+        # ================= 核心防限流：拦截图片、字体与多媒体 =================
+        async def block_unnecessary_resources(route):
+            # 过滤掉图片、音视频、网页字体、分析埋点，TCP 连接数直接锐减 80%
+            if route.request.resource_type in ["image", "media", "font"]:
+                await route.abort()
+            elif any(beacon in route.request.url.lower() for beacon in
+                     ["google-analytics", "doubleclick", "sensorsdata"]):
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await page.route("**/*", block_unnecessary_resources)
+        # ======================================================================
+
+
         print(f"🔗 正在导航至供应商搜索列表: {search_url}")
         await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(3500)
 
-        # 锁定在供应商选项卡
+        # 锁定供应商选项卡
         try:
             if "products" in page.url.lower():
                 supplier_tab = await page.query_selector('a[href*="searchList/suppliers"], :has-text("Suppliers")')
@@ -291,11 +354,15 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
                 "contact_person": detail_info["contact_person"],
                 "contact_title": detail_info["contact_title"],
                 "official_website": detail_info["official_website"],
+                "phone": detail_info["phone"],
                 "raw_products": detail_info["raw_products"],
                 "detail_content": detail_info["full_text"],
                 "card_product": clean_kw
             })
-            await page.wait_for_timeout(1500)
+
+            # 抓取完毕后随机冷却，避免触发 TCP 连接上限
+            vendor_cooldown = random.randint(4000, 7000)
+            await page.wait_for_timeout(vendor_cooldown)
 
         await context.close()
 
