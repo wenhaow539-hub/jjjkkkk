@@ -1,9 +1,0 @@
-2026/09/09-09:51:20.682 257c Reusing MANIFEST C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Local Storage\leveldb/MANIFEST-000001
-2026/09/09-09:51:20.685 257c Recovering log #53
-2026/09/09-09:51:20.686 257c Reusing old log C:\Users\DELL\PycharmProjects\jjkk\chrome_user_data\Default\Local Storage\leveldb/000053.log 
-2026/09/09-09:53:26.956 1dfc Level-0 table #57: started
-2026/09/09-09:53:26.961 1dfc Level-0 table #57: 48224 bytes OK
-2026/09/09-09:53:26.963 1dfc Delete type=0 #53
-2026/09/09-09:55:40.544 1dfc Level-0 table #59: started
-2026/09/09-09:55:40.546 1dfc Level-0 table #59: 49227 bytes OK
-2026/09/09-09:55:40.546 1dfc Delete type=0 #56
