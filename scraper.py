@@ -7,6 +7,14 @@ import subprocess
 import time
 from urllib.parse import quote_plus
 from playwright.async_api import async_playwright
+from dedup import dedup
+
+# ==========================================
+# 核心功能开关
+# ==========================================
+# True : 正常点击 View More / Exchange 按钮并解密电话（扣减配额）
+# False: 额度用尽时关闭。依然进入联系人页面抓取【姓名、职位、官网】，但绝不点击名片交换按钮
+UNLOCK_PHONE = False
 
 
 def is_port_open(host: str = "127.0.0.1", port: int = 9222) -> bool:
@@ -37,12 +45,16 @@ def ensure_chrome_running(port: int = 9222, profile_dir: str = r"C:\chrome_debug
 
     os.makedirs(profile_dir, exist_ok=True)
 
+    # 注入性能限制参数：约束磁盘与媒体缓存，禁用 GPU 着色器落盘
     cmd = [
         chrome_path,
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
-        "--no-default-browser-check"
+        "--no-default-browser-check",
+        "--disk-cache-size=20971520",       # 强制磁盘缓存最大 20MB
+        "--media-cache-size=1048576",       # 强制媒体缓存最大 1MB
+        "--disable-gpu-shader-disk-cache",  # 禁止将渲染着色器写入磁盘
     ]
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -176,7 +188,6 @@ def parse_contact_number_json(data: dict) -> list[str]:
 
     collected = []
 
-    # 固定电话 (telephoneList)
     for item in data.get("telephoneList") or []:
         cc = str(item.get("countryCode", "") or "").strip()
         ac = str(item.get("areaCode", "") or "").strip()
@@ -190,7 +201,6 @@ def parse_contact_number_json(data: dict) -> list[str]:
         if main_num:
             collected.append(main_num)
 
-    # 手机号 (mobileList / mobile)
     mobiles = []
     if "mobileList" in data and isinstance(data["mobileList"], list):
         mobiles.extend(data["mobileList"])
@@ -257,7 +267,6 @@ async def scrape_supplier_profile_detail(page, store_url: str) -> dict:
     print(f"      🏢 [1/3] 访问企业档案: {profile_url}")
     if await safe_navigate(page, profile_url):
         try:
-            # 拟人分段平滑滚动
             await page.mouse.wheel(0, 500)
             await human_delay(0.8, 1.5)
             await page.mouse.wheel(0, 500)
@@ -291,8 +300,7 @@ async def scrape_supplier_profile_detail(page, store_url: str) -> dict:
         except Exception as e:
             print(f"      ⚠️ 工商档案解析异常: {e}")
 
-    # 防反爬间隔：子页面切换缓冲
-    await human_delay(3.5, 6.0, desc="档案页浏览完毕")
+    await human_delay(2.5, 4.5, desc="档案页浏览完毕")
 
     # ==================== 2. 访问【Contact Us】====================
     print(f"      👤 [2/3] 访问联系人档案: {contact_url}")
@@ -310,55 +318,75 @@ async def scrape_supplier_profile_detail(page, store_url: str) -> dict:
                 except Exception:
                     pass
 
-        page.on("response", capture_contact_api)
+        if UNLOCK_PHONE:
+            page.on("response", capture_contact_api)
 
         try:
             await page.mouse.wheel(0, 400)
-            await human_delay(1.0, 2.0)
+            await human_delay(1.0, 1.8)
 
-            # 1. 寻找 View More
-            btn_selector = (
-                'button:has-text("View More"), '
-                'a:has-text("View More"), '
-                'div:has-text("View More"):not(:has(div)), '
-                'span:has-text("View More"), '
-                '[class*="view-more"], [class*="viewMore"]'
-            )
+            already_visible_phones = await page.evaluate("""
+                () => {
+                    let phones = [];
+                    const items = document.querySelectorAll('.contact-item');
+                    for (const it of items) {
+                        const label = (it.querySelector('.contact-label')?.innerText || "").toLowerCase();
+                        const val = it.querySelector('.contact-value')?.innerText || "";
+                        if (/(?:telephone|mobile)/i.test(label)) {
+                            const cleanVal = val.replace(/view\\s*more|exchange/ig, '').trim();
+                            if (cleanVal && /\\d{6,}/.test(cleanVal)) {
+                                phones.push(cleanVal);
+                            }
+                        }
+                    }
+                    return phones;
+                }
+            """)
 
-            view_more_btn = None
-            try:
-                view_more_btn = await page.wait_for_selector(btn_selector, timeout=4000, state="visible")
-            except Exception:
-                pass
-
-            if view_more_btn:
-                print("      🖱️ 发现【View More】按钮，准备交互...")
-                await view_more_btn.scroll_into_view_if_needed()
-                # 拟人悬停与思考间隔
-                await view_more_btn.hover()
-                await human_delay(1.0, 2.0, desc="点击前停顿")
-                await view_more_btn.click()
-                await human_delay(1.2, 2.5, desc="等待响应/弹窗")
-
-                # 2. 自动检测并确认 Exchange 弹窗
-                try:
-                    exchange_selector = (
-                        'button:has-text("Exchange"), '
-                        '.el-dialog__footer button:has-text("Exchange"), '
-                        'div[role="dialog"] button:has-text("Exchange"), '
-                        '.modal-footer button:has-text("Exchange")'
+            if UNLOCK_PHONE:
+                if already_visible_phones:
+                    print(f"      ⚡ 检测到联系方式已解锁/直接公开，跳过点击按钮: {already_visible_phones}")
+                else:
+                    btn_selector = (
+                        'button:has-text("View More"), '
+                        'a:has-text("View More"), '
+                        'div:has-text("View More"):not(:has(div)), '
+                        'span:has-text("View More"), '
+                        '[class*="view-more"], [class*="viewMore"]'
                     )
-                    exchange_btn = await page.wait_for_selector(exchange_selector, timeout=3000, state="visible")
-                    if exchange_btn:
-                        print("      🪪 检测到【Exchange 名片交换】弹窗...")
-                        await exchange_btn.hover()
-                        await human_delay(0.8, 1.6, desc="名片弹窗思考")
-                        await exchange_btn.click()
-                        await human_delay(2.0, 3.5, desc="名片交换完成")
-                except Exception:
-                    pass
 
-            # 3. 提取联系人姓名、官网与 DOM 数据
+                    view_more_btn = None
+                    try:
+                        view_more_btn = await page.wait_for_selector(btn_selector, timeout=3000, state="visible")
+                    except Exception:
+                        pass
+
+                    if view_more_btn:
+                        print("      🖱️ 发现【View More】遮罩，正在模拟点击...")
+                        await view_more_btn.scroll_into_view_if_needed()
+                        await view_more_btn.hover()
+                        await human_delay(0.8, 1.5, desc="点击前停顿")
+                        await view_more_btn.click()
+                        await human_delay(1.2, 2.0, desc="等待解密响应")
+
+                        try:
+                            exchange_selector = (
+                                'button:has-text("Exchange"), '
+                                '.el-dialog__footer button:has-text("Exchange"), '
+                                'div[role="dialog"] button:has-text("Exchange"), '
+                                '.modal-footer button:has-text("Exchange")'
+                            )
+                            exchange_btn = await page.wait_for_selector(exchange_selector, timeout=2500, state="visible")
+                            if exchange_btn:
+                                print("      🪪 检测到【Exchange 名片交换】弹窗，自动点击...")
+                                await exchange_btn.hover()
+                                await exchange_btn.click()
+                                await human_delay(1.5, 2.5, desc="名片交换处理")
+                        except Exception:
+                            pass
+            else:
+                print("      🛡️ [配额保护] 跳过 View More/名片交换点击，仅提取公开联系人信息与官网。")
+
             contact_data = await page.evaluate("""
                 () => {
                     let person = "", title = "", fallbackAddr = "", officialWebsite = "";
@@ -402,12 +430,12 @@ async def scrape_supplier_profile_detail(page, store_url: str) -> dict:
             """)
 
             combined_phone = merge_and_dedup_phones(
+                already_visible_phones,
                 api_phones,
                 contact_data.get("domTelephones", []),
                 contact_data.get("domMobiles", [])
             )
             info["phone"] = combined_phone
-
             info["contact_person"] = clean_token(contact_data.get("person", ""))
             info["contact_title"] = clean_token(contact_data.get("title", ""))
             info["official_website"] = normalize_website(contact_data.get("officialWebsite", ""))
@@ -415,20 +443,20 @@ async def scrape_supplier_profile_detail(page, store_url: str) -> dict:
             if not info["registered_address"] and contact_data.get("fallbackAddr"):
                 info["registered_address"] = clean_token(contact_data.get("fallbackAddr"))
 
-            if info["phone"]:
-                print(f"      📞 [电话提取/去重完毕]: {info['phone']}")
             if info["contact_person"]:
                 print(f"      👤 [抓取成功] 联系人: {info['contact_person']} | 职位: {info['contact_title'] or '未注明'}")
             if info["official_website"]:
-                print(f"      🌐 [抓取成功] 独立企业官网: {info['official_website']}")
+                print(f"      🌐 [抓取成功] 企业官网: {info['official_website']}")
+            if info["phone"]:
+                print(f"      📞 [电话提取/公开可用]: {info['phone']}")
 
         except Exception as e:
             print(f"      ⚠️ 联系人页解析异常: {e}")
         finally:
-            page.remove_listener("response", capture_contact_api)
+            if UNLOCK_PHONE:
+                page.remove_listener("response", capture_contact_api)
 
-    # 防反爬间隔：子页面切换缓冲
-    await human_delay(3.5, 6.0, desc="联系人页浏览完毕")
+    await human_delay(2.5, 4.5, desc="联系人页浏览完毕")
 
     # ==================== 3. 访问【Showroom】====================
     print(f"      📦 [3/3] 访问产品展厅: {showroom_url}")
@@ -463,7 +491,6 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
     ensure_chrome_running(port=9222)
 
     clean_kw = keyword.lower().replace("manufacturer", "").strip()
-    search_url = f"https://www.globalsources.com/searchList/suppliers?keyWord={quote_plus(clean_kw)}&pageNum=1"
 
     candidate_sellers = []
     final_results = []
@@ -478,9 +505,9 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
 
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
 
-        # 核心防限流：拦截图片与媒体
+        # 核心防限流与流量压减：新增 stylesheet 样式表拦截，不下载 CSS
         async def block_unnecessary_resources(route):
-            if route.request.resource_type in ["image", "media", "font"]:
+            if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
                 await route.abort()
             elif any(beacon in route.request.url.lower() for beacon in ["google-analytics", "doubleclick", "sensorsdata"]):
                 await route.abort()
@@ -489,60 +516,97 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
 
         await page.route("**/*", block_unnecessary_resources)
 
-        print(f"🔗 正在导航至供应商搜索列表: {search_url}")
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-        await human_delay(3.5, 5.5, desc="列表页初始加载")
+        # ========================================================
+        # 核心多页自动翻页检索循环：凑满 max_count 家未抓取的新店铺
+        # ========================================================
+        page_num = 1
+        max_search_pages = 30
 
-        # 锁定供应商选项卡
-        try:
-            if "products" in page.url.lower():
-                supplier_tab = await page.query_selector('a[href*="searchList/suppliers"], :has-text("Suppliers")')
-                if supplier_tab:
-                    await supplier_tab.click()
-                    await human_delay(3.0, 4.5, desc="切换至供应商列表")
-        except Exception:
-            pass
+        while len(candidate_sellers) < max_count and page_num <= max_search_pages:
+            search_url = f"https://www.globalsources.com/searchList/suppliers?keyWord={quote_plus(clean_kw)}&pageNum={page_num}"
+            print(f"\n📑 [多页翻页] 正在检索搜索列表第 {page_num} 页: {search_url}")
 
-        # 拟人平滑滚动加载列表
-        for _ in range(4):
-            scroll_delta = random.randint(600, 950)
-            await page.mouse.wheel(0, scroll_delta)
-            await human_delay(1.0, 2.2)
-
-        candidate_elements = await page.query_selector_all(
-            'a[href*="manufacturer.globalsources.com/homepage_"], a[href*="/si/"], a.company-name, a.supplier-name'
-        )
-        if not candidate_elements:
-            candidate_elements = await page.query_selector_all('a[href*="manufacturer.globalsources.com"]')
-
-        print(f"📦 筛选到 {len(candidate_elements)} 个供应商候选链接，正在清洗...")
-
-        for el in candidate_elements:
-            if len(candidate_sellers) >= max_count:
+            nav_ok = await safe_navigate(page, search_url)
+            if not nav_ok:
+                print(f"⚠️ 第 {page_num} 页加载失败，终止翻页。")
                 break
-            href = await el.get_attribute("href") or ""
-            if any(pk in href.lower() for pk in ["/pdtl/", "/product_", "productdetail", "/product/"]):
-                continue
 
-            text = (await el.inner_text()).strip()
-            title_attr = (await el.get_attribute("title") or "").strip()
-            comp_name = title_attr if is_valid_company_name(title_attr) else text
+            await human_delay(3.0, 4.5, desc=f"第 {page_num} 页列表加载")
 
-            if is_valid_company_name(comp_name) and comp_name not in seen_companies and href:
-                seen_companies.add(comp_name)
-                candidate_sellers.append({
-                    "company": comp_name,
-                    "store_url": format_clean_url(href)
-                })
+            try:
+                if "products" in page.url.lower():
+                    supplier_tab = await page.query_selector('a[href*="searchList/suppliers"], :has-text("Suppliers")')
+                    if supplier_tab:
+                        await supplier_tab.click()
+                        await human_delay(2.5, 3.5, desc="切换至供应商列表")
+            except Exception:
+                pass
 
-        print(f"🎯 成功锁定 {len(candidate_sellers)} 家真实供应商店铺！\n")
+            for _ in range(4):
+                scroll_delta = random.randint(600, 950)
+                await page.mouse.wheel(0, scroll_delta)
+                await human_delay(0.8, 1.6)
 
+            candidate_elements = await page.query_selector_all(
+                'a[href*="manufacturer.globalsources.com/homepage_"], a[href*="/si/"], a.company-name, a.supplier-name'
+            )
+            if not candidate_elements:
+                candidate_elements = await page.query_selector_all('a[href*="manufacturer.globalsources.com"]')
+
+            if not candidate_elements:
+                print(f"🏁 第 {page_num} 页未检测到任何供应商卡片，搜索结果已到底！")
+                break
+
+            print(f"📦 第 {page_num} 页发现 {len(candidate_elements)} 个供应商卡片，执行哈希指纹过滤...")
+
+            page_added = 0
+            for el in candidate_elements:
+                if len(candidate_sellers) >= max_count:
+                    break
+
+                href = await el.get_attribute("href") or ""
+                if any(pk in href.lower() for pk in ["/pdtl/", "/product_", "productdetail", "/product/"]):
+                    continue
+
+                text = (await el.inner_text()).strip()
+                title_attr = (await el.get_attribute("title") or "").strip()
+                comp_name = title_attr if is_valid_company_name(title_attr) else text
+                clean_url = format_clean_url(href).rstrip('/')
+
+                if dedup.is_seen(comp_name) or dedup.is_seen(clean_url):
+                    print(f"      ⏭️ [指纹库命中] 跳过已采店铺: {comp_name}")
+                    continue
+
+                if is_valid_company_name(comp_name) and comp_name not in seen_companies and href:
+                    seen_companies.add(comp_name)
+                    candidate_sellers.append({
+                        "company": comp_name,
+                        "store_url": clean_url
+                    })
+                    page_added += 1
+
+            print(f"✅ 第 {page_num} 页提取到 {page_added} 家全新供应商（当前累计已就绪: {len(candidate_sellers)}/{max_count}）")
+
+            if len(candidate_sellers) < max_count:
+                page_num += 1
+                await human_delay(3.0, 5.0, desc="翻页冷却")
+
+        print(f"\n🎯 候选商户锁定完成！共在全站多页中锁定 {len(candidate_sellers)} 家未抓取的新供应商，开始挖掘详情...\n")
+
+        # ========================================================
+        # 逐家店铺穿透并实时写入指纹库（包含内存释放机制）
+        # ========================================================
         for idx, seller in enumerate(candidate_sellers, 1):
             comp_name = seller["company"]
             store_url = seller["store_url"]
             print(f"\n🔍 [{idx}/{len(candidate_sellers)}] 深入挖掘: {comp_name}")
 
             detail_info = await scrape_supplier_profile_detail(page, store_url)
+
+            dedup.add(comp_name)
+            dedup.add(store_url)
+            if detail_info.get("registered_company"):
+                dedup.add(detail_info["registered_company"])
 
             final_results.append({
                 "company": comp_name,
@@ -559,14 +623,24 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
                 "card_product": clean_kw
             })
 
-            # 防反爬间隔：单个供应商处理完毕后的随机冷却
             if idx < len(candidate_sellers):
-                await human_delay(6.0, 11.0, desc=f"完成第 {idx} 家，商铺间防风控冷却")
+                await human_delay(4.0, 7.0, desc=f"完成第 {idx} 家，商铺间防风控冷却")
 
-            # 核心防限流策略：每完成 5 家触发一次长时间小憩，让 WAF 计数器衰减
+            # 批次冷却与 Chrome 标签页内存清理重置
             if idx % 5 == 0 and idx < len(candidate_sellers):
-                batch_pause = random.randint(18, 30)
+                batch_pause = random.randint(15, 25)
                 print(f"\n☕ [长效冷却] 已连续抓取 5 家商户，休息 {batch_pause} 秒避开 WAF 频率检测...")
+
+                # 彻底销毁旧标签页并新建，清空 V8 引擎历史栈与临时内存
+                try:
+                    await page.close()
+                    page = await context.new_page()
+                    await page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
+                    await page.route("**/*", block_unnecessary_resources)
+                    print("🧹 [内存释放] 已重置当前标签页，Chrome 内存占用已释放归零。")
+                except Exception as e:
+                    print(f"⚠️ 标签页重置失败: {e}")
+
                 await asyncio.sleep(batch_pause)
 
         try:
@@ -574,5 +648,5 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
         except Exception:
             pass
 
-    print(f"\n🎉 深度采集完毕，共获取 {len(final_results)} 家纯供应商线索！")
+    print(f"\n🎉 深度采集完毕，共获取 {len(final_results)} 家新增线索！")
     return final_results

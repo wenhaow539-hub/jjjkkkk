@@ -1,65 +1,45 @@
 import re
-import requests
-import urllib3
+import aiohttp
+from typing import Tuple, List
 
-# 忽略 SSL 警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# 正则提取器
+EMAIL_REGEX = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
+WHATSAPP_REGEX = r'(?:https?://(?:wa\.me|api\.whatsapp\.com/send\?phone=)|whatsapp:\s*)([+\d\s-]{8,20})'
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
-}
 
-PROVINCES = "京津沪渝冀晋蒙辽吉黑苏浙皖闽赣鲁豫鄂湘粤琼川贵云陕甘青宁新"
-
-# 1. 工信部 ICP 备案正则 (如：粤ICP备19082517号、京ICP备12345678号-1)
-ICP_REGEX = rf'([{PROVINCES}]\s*ICP\s*备\s*\d+\s*号(?:-\d+)?)'
-
-# 2. 全国公安机关网安备案正则 (如：粤公网安备 44030502008518号)
-POLICE_REGEX = rf'([{PROVINCES}]?\s*公网安备\s*[\d\s]+号?)'
-
-def check_website_filing(website: str) -> str:
+async def search_official_website(company_name: str, api_key: str = "") -> str:
     """
-    穿透企业官网首页及页脚，检测并提取：
-    1. 工信部 ICP 备案号 (如 粤ICP备19082517号)
-    2. 公安网安备案号 (如 粤公网安备 44030502008518号)
+    通过 Google Search / SerpAPI 根据法定全称搜索独立官网
+    （若无第三方 API，可接入免费的 DuckDuckGo / SearXNG 接口）
     """
-    if not website or not website.startswith("http"):
-        return "无独立官网"
+    # 模拟外部反查逻辑：若原本已有企业自建站则直接复用
+    clean_query = company_name.replace("Co., Ltd", "").strip()
+    # 生产环境中调用: https://serpapi.com/search.json?q={clean_query}+official+website
+    return ""
 
-    print(f"      🛡️ 正在探测官网合规备案: {website}")
-    try:
-        resp = requests.get(website, headers=HEADERS, timeout=8, verify=False)
-        html = resp.content.decode(resp.encoding or 'utf-8', errors='ignore')
 
-        filings = []
+async def extract_contacts_from_site(website_url: str) -> Tuple[List[str], List[str]]:
+    """深度穿透外部独立站首页及 /contact-us，反查邮箱与 WhatsApp"""
+    if not website_url or not website_url.startswith("http"):
+        return [], []
 
-        # 匹配 ICP 备案
-        icp_match = re.search(ICP_REGEX, html, re.I)
-        if icp_match:
-            clean_icp = re.sub(r'\s+', '', icp_match.group(1)).strip()
-            filings.append(clean_icp)
+    emails = set()
+    whatsapps = set()
+    target_urls = [website_url, website_url.rstrip("/") + "/contact", website_url.rstrip("/") + "/contact-us"]
 
-        # 匹配公安网安备案
-        police_match = re.search(POLICE_REGEX, html)
-        if police_match:
-            clean_police = re.sub(r'\s+', ' ', police_match.group(0)).strip()
-            filings.append(clean_police)
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+        for url in target_urls:
+            try:
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                async with session.get(url, headers=headers, ssl=False) as resp:
+                    if resp.status == 200:
+                        html = await resp.text()
+                        for em in re.findall(EMAIL_REGEX, html):
+                            if not any(ign in em.lower() for ign in [".png", ".jpg", "example", "domain"]):
+                                emails.add(em)
+                        for wa in re.findall(WHATSAPP_REGEX, html):
+                            whatsapps.add(wa.strip())
+            except Exception:
+                continue
 
-        # 备选：从公安备案官方跳转外链中提取 recordcode
-        if not police_match:
-            record_code_match = re.search(r'beian\.(?:gov|mps)\.cn/.*?recordcode=(\d+)', html, re.I)
-            if record_code_match:
-                filings.append(f"公网安备:{record_code_match.group(1)}")
-
-        if filings:
-            result_str = " | ".join(filings)
-            print(f"      📌 [备案抓取成功] {result_str}")
-            return result_str
-
-        return "无备案"
-
-    except Exception as e:
-        print(f"      ⚠️ 官网无法连通或检测超时: {e}")
-        return "官网无法访问/无"
+    return list(emails), list(whatsapps)
