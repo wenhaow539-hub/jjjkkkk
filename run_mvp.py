@@ -3,7 +3,7 @@ from pipeline import run_pipeline
 
 # 核心采集配置
 SEARCH_KEYWORD = "monitor"    # 搜索品类关键词
-SCRAPE_LIMIT = 5              # 本次计划抓取商家数量
+SCRAPE_LIMIT = 10              # 本次计划抓取商家数量
 OUTPUT_FILE = "suppliers_leads.xlsx"
 
 if __name__ == "__main__":

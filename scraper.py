@@ -12,8 +12,6 @@ from dedup import dedup
 # ==========================================
 # 核心功能开关
 # ==========================================
-# True : 正常点击 View More / Exchange 按钮并解密电话（扣减配额）
-# False: 额度用尽时关闭。依然进入联系人页面抓取【姓名、职位、官网】，但绝不点击名片交换按钮
 UNLOCK_PHONE = False
 
 
@@ -45,16 +43,15 @@ def ensure_chrome_running(port: int = 9222, profile_dir: str = r"C:\chrome_debug
 
     os.makedirs(profile_dir, exist_ok=True)
 
-    # 注入性能限制参数：约束磁盘与媒体缓存，禁用 GPU 着色器落盘
     cmd = [
         chrome_path,
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--disk-cache-size=20971520",       # 强制磁盘缓存最大 20MB
-        "--media-cache-size=1048576",       # 强制媒体缓存最大 1MB
-        "--disable-gpu-shader-disk-cache",  # 禁止将渲染着色器写入磁盘
+        "--disk-cache-size=20971520",
+        "--media-cache-size=1048576",
+        "--disable-gpu-shader-disk-cache",
     ]
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -505,9 +502,8 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
 
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
 
-        # 核心防限流与流量压减：新增 stylesheet 样式表拦截，不下载 CSS
         async def block_unnecessary_resources(route):
-            if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
+            if route.request.resource_type in ["image", "media", "font"]:
                 await route.abort()
             elif any(beacon in route.request.url.lower() for beacon in ["google-analytics", "doubleclick", "sensorsdata"]):
                 await route.abort()
@@ -516,9 +512,6 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
 
         await page.route("**/*", block_unnecessary_resources)
 
-        # ========================================================
-        # 核心多页自动翻页检索循环：凑满 max_count 家未抓取的新店铺
-        # ========================================================
         page_num = 1
         max_search_pages = 30
 
@@ -557,7 +550,7 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
                 print(f"🏁 第 {page_num} 页未检测到任何供应商卡片，搜索结果已到底！")
                 break
 
-            print(f"📦 第 {page_num} 页发现 {len(candidate_elements)} 个供应商卡片，执行哈希指纹过滤...")
+            print(f"📦 第 {page_num} 页发现 {len(candidate_elements)} 个供应商卡片，执行名称指纹过滤...")
 
             page_added = 0
             for el in candidate_elements:
@@ -573,7 +566,8 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
                 comp_name = title_attr if is_valid_company_name(title_attr) else text
                 clean_url = format_clean_url(href).rstrip('/')
 
-                if dedup.is_seen(comp_name) or dedup.is_seen(clean_url):
+                # 仅根据 company 进行指纹比对
+                if dedup.is_seen(comp_name):
                     print(f"      ⏭️ [指纹库命中] 跳过已采店铺: {comp_name}")
                     continue
 
@@ -593,9 +587,6 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
 
         print(f"\n🎯 候选商户锁定完成！共在全站多页中锁定 {len(candidate_sellers)} 家未抓取的新供应商，开始挖掘详情...\n")
 
-        # ========================================================
-        # 逐家店铺穿透并实时写入指纹库（包含内存释放机制）
-        # ========================================================
         for idx, seller in enumerate(candidate_sellers, 1):
             comp_name = seller["company"]
             store_url = seller["store_url"]
@@ -603,8 +594,8 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
 
             detail_info = await scrape_supplier_profile_detail(page, store_url)
 
+            # 持久化存储：仅记录店铺名称与法定工商全称
             dedup.add(comp_name)
-            dedup.add(store_url)
             if detail_info.get("registered_company"):
                 dedup.add(detail_info["registered_company"])
 
@@ -626,18 +617,19 @@ async def scrape_globalsources_suppliers(keyword: str = "led", max_count: int = 
             if idx < len(candidate_sellers):
                 await human_delay(4.0, 7.0, desc=f"完成第 {idx} 家，商铺间防风控冷却")
 
-            # 批次冷却与 Chrome 标签页内存清理重置
             if idx % 5 == 0 and idx < len(candidate_sellers):
                 batch_pause = random.randint(15, 25)
                 print(f"\n☕ [长效冷却] 已连续抓取 5 家商户，休息 {batch_pause} 秒避开 WAF 频率检测...")
 
-                # 彻底销毁旧标签页并新建，清空 V8 引擎历史栈与临时内存
+                # 必须先新建标签页，再关闭旧标签页，防止 Chrome 因无活跃标签页而整个进程关闭
                 try:
+                    new_page = await context.new_page()
                     await page.close()
-                    page = await context.new_page()
+                    page = new_page
+
                     await page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
                     await page.route("**/*", block_unnecessary_resources)
-                    print("🧹 [内存释放] 已重置当前标签页，Chrome 内存占用已释放归零。")
+                    print("🧹 [内存释放] 已安全置换标签页，Chrome 依然保持存活。")
                 except Exception as e:
                     print(f"⚠️ 标签页重置失败: {e}")
 
