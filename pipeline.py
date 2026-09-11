@@ -11,7 +11,7 @@ from playwright.async_api import async_playwright
 
 import config
 from adapters import BaseCrawler, CrawlerFactory
-import crawlers  # 触发爬虫模块自动注册
+import crawlers
 from evaluator import evaluate_supplier_icp
 from models import RawSupplierLead
 
@@ -20,7 +20,6 @@ IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.css', '.js', '
 JUNK_EMAIL_DOMAINS = ('wixpress.com', 'sentry.io', 'example.com', 'domain.com', 'google.com', 'myshopify.com')
 INVALID_PREFIXES = ('noreply', 'no-reply', 'mailer-daemon', 'donotreply')
 
-# 匹配工信部 ICP 备案号及公安网安备案号
 ICP_REGEX = re.compile(
     r'([京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-Za-z]?ICP备\s*\d+\s*号?(?:-\d+)?|'
     r'[A-Za-z\u4e00-\u9fa5]*ICP[备证]\s*\d+\s*号?(?:-\d+)?|'
@@ -49,20 +48,38 @@ TARGET_COLUMNS = [
 # ==========================================
 # 电话归一与智能排重模块
 # ==========================================
+def sanitize_phone_string(raw_p: str) -> str:
+    """清洗号码中的粘连杂质，纠正多余的前缀数字"""
+    clean_val = raw_p.strip()
+    # 提取纯数字比对
+    digits = re.sub(r'\D', '', clean_val)
+    if digits.startswith("86"):
+        digits = digits[2:]
+
+    # 针对类似 2013632694344（多出前缀20）的手机号做纠正
+    mobile_match = re.search(r'(1[3-9]\d{9})$', digits)
+    if mobile_match:
+        return f"+86 {mobile_match.group(1)}"
+
+    # 规范座机（如 75523210872 -> +86 755-23210872）
+    landline_match = re.search(r'([1-9]\d{1,2})(\d{7,8})$', digits)
+    if landline_match:
+        return f"+86 {landline_match.group(1)}-{landline_match.group(2)}"
+
+    return clean_val
+
+
 def get_canonical_phone(raw_phone: str) -> str:
-    """提取号码的核心数字指纹，剥离 +86、0086、前导0与标点空格差异"""
     if not raw_phone:
         return ""
     main_part = re.split(r'(?:ext|分机|转)', raw_phone, flags=re.I)[0]
     digits = re.sub(r'\D', '', main_part)
 
-    # 剥离国家代码 0086 / 86
     if digits.startswith("0086"):
         digits = digits[4:]
     elif digits.startswith("86") and len(digits) >= 11:
         digits = digits[2:]
 
-    # 剥离国内固话区号前导 0 (例如 0755 -> 755, 0519 -> 519)
     if digits.startswith("0") and len(digits) >= 10:
         digits = digits[1:]
 
@@ -70,7 +87,6 @@ def get_canonical_phone(raw_phone: str) -> str:
 
 
 def score_phone_format(val: str) -> int:
-    """对同一物理号码的不同展示排版打分，优先保留排版规范的版本"""
     score = 0
     if "+" in val:
         score += 5
@@ -78,33 +94,25 @@ def score_phone_format(val: str) -> int:
         score += 3
     if " " in val:
         score += 2
-    # 扣分：+86 紧跟 0 是不规范写法 (+86 0755...)
     if re.search(r'(?:\+86|86)[\s\-]*0\d', val):
         score -= 4
-    # 纯无分隔符长串减分
     if re.match(r'^\+?\d+$', val.strip()):
         score -= 1
     return score
 
 
 def deduplicate_phone_list(phones: list[str]) -> list[str]:
-    """根据核心数字指纹去重，同号码优选排版质量最高的版本"""
     seen_dict: dict[str, str] = {}
-
     for p in phones:
-        clean_p = re.sub(r'^[^\d+]+|[^\d]+$', '', p.strip())
+        clean_p = sanitize_phone_string(p)
         fingerprint = get_canonical_phone(clean_p)
-
         if not fingerprint or len(fingerprint) < 7:
             continue
-
         if fingerprint not in seen_dict:
             seen_dict[fingerprint] = clean_p
         else:
-            existing_val = seen_dict[fingerprint]
-            if score_phone_format(clean_p) > score_phone_format(existing_val):
+            if score_phone_format(clean_p) > score_phone_format(seen_dict[fingerprint]):
                 seen_dict[fingerprint] = clean_p
-
     return list(seen_dict.values())
 
 
@@ -112,8 +120,6 @@ def deduplicate_phone_list(phones: list[str]) -> list[str]:
 # 独立站深度挖掘与解析器
 # ==========================================
 class WebsiteEnricher:
-    """利用 HTTPX 穿透独立站，提取商业邮箱、官网联系方式（去重规范）与 ICP 备案"""
-
     def __init__(self, concurrency: int = 5):
         self.semaphore = asyncio.Semaphore(concurrency)
         self.timeout = httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0)
@@ -142,13 +148,13 @@ class WebsiteEnricher:
     def _extract_valid_phones(self, html: str) -> list[str]:
         found_phones = []
 
-        # 1. 点击拨号链接: a href="tel:..."
+        # 1. 拨号链接
         for tel in re.findall(r'href=["\']tel:([^"\'>]+)["\']', html, re.I):
             clean_p = re.sub(r'[^\d+\-\s()]', '', tel.strip())
             if len(re.sub(r'\D', '', clean_p)) >= 7:
                 found_phones.append(clean_p)
 
-        # 2. WhatsApp 链接提取
+        # 2. WhatsApp 链接
         wa_pattern = r'(?:wa\.me/(?:send\?.*?[?&]phone=)?|api\.whatsapp\.com/send\?.*?[?&]phone=)([+\d]+)'
         for wa in re.findall(wa_pattern, html, re.I):
             clean_wa = wa.strip()
@@ -157,14 +163,14 @@ class WebsiteEnricher:
             if len(re.sub(r'\D', '', clean_wa)) >= 8:
                 found_phones.append(clean_wa)
 
-        # 3. 剥离 script/style 代码块
+        # 3. 剥离脚本标签
         clean_visible_text = re.sub(
             r'<(script|style|svg|noscript)[^>]*>.*?</\1>', '', html,
             flags=re.DOTALL | re.IGNORECASE
         )
         clean_visible_text = re.sub(r'<[^>]+>', ' ', clean_visible_text)
 
-        # 4. 正文中带标签的号码
+        # 4. 显式标签匹配
         labeled_matches = re.findall(
             r'(?:phone|telephone|mobile|tel|whatsapp|cell|contact)\s*[:：]?\s*([+\d\s\-\(\)\.]{7,25})',
             clean_visible_text, re.I
@@ -172,13 +178,13 @@ class WebsiteEnricher:
         for p in labeled_matches:
             digits = re.sub(r'\D', '', p)
             if 7 <= len(digits) <= 16 and not digits.startswith("202") and not digits.startswith("201"):
-                found_phones.append(re.sub(r'\s+', ' ', p).strip())
+                found_phones.append(p.strip())
 
-        # 5. 国际格式号码 (+86 手机及 0755 等座机，如 +86 755-23210872, +86 13632694344)
+        # 5. 国际格式号码 (+86 手机及带区号固话)
         for intl in re.findall(r'\+86[\s\-]?(?:1[3-9]\d[\s\-]?\d{4}[\s\-]?\d{4}|[1-9]\d{1,3}[\s\-]?\d{7,8})', clean_visible_text):
-            found_phones.append(re.sub(r'\s+', ' ', intl).strip())
+            found_phones.append(intl.strip())
 
-        # 6. 国内标准带区号固话格式 (如 0755-23210872)
+        # 6. 国内标准固话
         for domestic in re.findall(r'(?:0[1-9]\d{1,2}[\s\-])\d{7,8}', clean_visible_text):
             found_phones.append(domestic.strip())
 
@@ -194,11 +200,9 @@ class WebsiteEnricher:
         parsed = urlparse(url)
         if parsed.netloc:
             if parsed.netloc.startswith("www."):
-                no_www = parsed.netloc[4:]
-                candidates.append(parsed._replace(netloc=no_www).geturl())
+                candidates.append(parsed._replace(netloc=parsed.netloc[4:]).geturl())
             else:
-                www_net = f"www.{parsed.netloc}"
-                candidates.append(parsed._replace(netloc=www_net).geturl())
+                candidates.append(parsed._replace(netloc=f"www.{parsed.netloc}").geturl())
 
         last_error = "未知错误"
         for cand in dict.fromkeys(candidates):
@@ -228,11 +232,10 @@ class WebsiteEnricher:
             icp_match = ICP_REGEX.search(home_html)
             result["icp"] = re.sub(r'\s+', '', icp_match.group(1)) if icp_match else "无"
 
-            # 2. 挖掘邮箱与官网联系电话
             raw_emails = self._extract_valid_emails(home_html)
             raw_phones = self._extract_valid_phones(home_html)
 
-            # 3. 提取子页面：确保 contact 页面优先级高于 about 页面
+            # 2. 穿透联系页：优先扫描 contact 页面
             all_links = re.findall(r'href=["\']([^"\']*(?:contact|about)[^"\']*)["\']', home_html, re.I)
             unique_links = list(dict.fromkeys(all_links))
             unique_links.sort(key=lambda x: 0 if "contact" in x.lower() else 1)
@@ -259,11 +262,25 @@ class WebsiteEnricher:
                         raw_emails.extend(self._extract_valid_emails(sub_html))
                         raw_phones.extend(self._extract_valid_phones(sub_html))
 
+            # 3. 邮箱排序：同域企业邮箱 > 业务前缀邮箱 > 第三方免费邮箱
             if raw_emails:
-                pri = [e for e in raw_emails if any(k in e for k in ["sales", "info", "contact", "export"])]
-                result["email"] = pri[0] if pri else raw_emails[0]
+                site_domain = urlparse(website).netloc.replace("www.", "").lower()
+
+                def score_email(e: str) -> int:
+                    score = 0
+                    if site_domain in e:
+                        score += 50
+                    if any(k in e for k in ["sales", "info", "contact", "export"]):
+                        score += 20
+                    if any(free in e for free in ["@gmail.com", "@yahoo.com", "@hotmail.com"]):
+                        score -= 10
+                    return score
+
+                sorted_emails = sorted(list(set(raw_emails)), key=score_email, reverse=True)
+                result["email"] = sorted_emails[0]
                 print(f"      📧 [官网邮箱] 提取成功: {result['email']} ({website})")
 
+            # 4. 号码净化与指纹排重
             clean_phones = deduplicate_phone_list(raw_phones)
             if clean_phones:
                 result["site_phone"] = " / ".join(clean_phones[:3])
@@ -276,11 +293,9 @@ class WebsiteEnricher:
 
 
 # ==========================================
-# 天眼查自动化触点补全模块 (带反爬冷却与滑块感知)
+# 天眼查自动化触点补全模块
 # ==========================================
 class TianyanchaEnricher:
-    """复用本地 Chrome CDP 会话，带防风控拟人延时与滑块验证码人工接管"""
-
     async def _human_rest(self, min_sec: float = 3.0, max_sec: float = 5.0, desc: str = ""):
         rest_time = round(random.uniform(min_sec, max_sec), 2)
         if desc:
@@ -339,7 +354,7 @@ class TianyanchaEnricher:
             )
             await self._handle_captcha_if_needed(page)
             await page.mouse.wheel(0, random.randint(200, 450))
-            await self._human_rest(1.5, 2.5, desc="搜索结果渲染观察")
+            await self._human_rest(1.5, 2.5, desc="观察页面")
 
             card_el = await page.query_selector('div[class*="search-item"], .search-block, div[class*="result-item"]')
             if not card_el:
@@ -382,7 +397,7 @@ class TianyanchaEnricher:
                 if link_el:
                     href = await link_el.get_attribute("href")
                     if href:
-                        await self._human_rest(1.0, 1.5, desc="点击进详情页")
+                        await self._human_rest(1.0, 1.5, desc="进详情页")
                         await page.goto(urljoin("https://www.tianyancha.com", href), wait_until="domcontentloaded", timeout=20000)
                         await self._handle_captcha_if_needed(page)
 
@@ -429,7 +444,6 @@ async def run_pipeline(
     print(f"🌐 目标平台: {platform} | 关键词: {keyword} | 计划采集: {max_count}")
     print(f"=======================================================")
 
-    # 1. 动态获取对应平台的爬虫并抓取
     crawler: BaseCrawler = CrawlerFactory.get_crawler(platform)
     leads_data: list[RawSupplierLead] = await crawler.scrape(keyword=keyword, max_count=max_count)
 
@@ -437,12 +451,12 @@ async def run_pipeline(
         print("\n💡 未采集到任何有效商户，流程结束。")
         return
 
-    # 2. 独立站穿透挖掘
     enriched_results = [
         {"site_phone": "", "tyc_phone": "", "email": "", "icp": "无", "contact_person": "", "contact_title": ""}
         for _ in leads_data
     ]
 
+    # 1. 独立站穿透
     if enrich_websites:
         print(f"\n🌐 [Enrichment 1/2] 异步穿透独立站探测商业邮箱、官网联系方式与备案...")
         enricher = WebsiteEnricher(concurrency=5)
@@ -455,8 +469,8 @@ async def run_pipeline(
             enriched_results[i]["site_phone"] = s_res.get("site_phone", "")
             enriched_results[i]["icp"] = s_res.get("icp", "无")
 
-    # 3. 大模型工商质检与全称规范
-    print(f"\n🧠 [LLM 质检] 调用 DeepSeek 模型分析工商全称与工厂画像...")
+    # 2. 大模型质检（严格禁止臆造）
+    print(f"\n🧠 [LLM 质检] 调用 DeepSeek 模型规范工商全称...")
     eval_results = []
     for idx, lead in enumerate(leads_data, 1):
         try:
@@ -466,26 +480,25 @@ async def run_pipeline(
                 base_url=config.OPENAI_BASE_URL,
                 model=config.MODEL_NAME
             )
-            display_name = eval_res.clean_company_name or '境外/非标准企业'
+            display_name = eval_res.clean_company_name or '无官方中文名/离岸主体'
             print(f"      ✨ [{idx}/{len(leads_data)}] 质检提纯: {lead.company} -> {display_name}")
         except Exception as e:
             print(f"      ⚠️ [{idx}/{len(leads_data)}] 质检跳过异常: {lead.company} ({e})")
             class FallbackEval:
-                clean_company_name = lead.registered_company or lead.company
+                clean_company_name = lead.registered_company or ""
             eval_res = FallbackEval()
 
         eval_results.append(eval_res)
 
-    # 4. 天眼查触点与地址兜底
+    # 3. 天眼查触点补全（门禁防护：必须有确切中文名才查）
     if enrich_tianyancha:
         needing_indices = []
         for i, (lead, enrich_res, eval_res) in enumerate(zip(leads_data, enriched_results, eval_results)):
-            target = (eval_res.clean_company_name or lead.registered_company or lead.company or "").strip()
-            clean_target = re.sub(r'[\.,;:\s"\'\)]+$', '', target).lower()
-            is_overseas = any(clean_target.endswith(s) for s in ["gmbh", "llc", "s.r.l.", "pte. ltd.", "pte ltd", "inc", "corp"])
+            target = (eval_res.clean_company_name or lead.registered_company or "").strip()
+            # 只有当确实存在中文名时才允许去查天眼查，严禁拿英文名乱撞
             has_chinese = bool(re.search(r'[\u4e00-\u9fa5]', target))
 
-            if (has_chinese or not is_overseas) and (not enrich_res.get("site_phone") or not lead.registered_address):
+            if has_chinese and (not enrich_res.get("site_phone") or not lead.registered_address):
                 needing_indices.append(i)
 
         if needing_indices:
@@ -501,7 +514,7 @@ async def run_pipeline(
                     for idx in needing_indices:
                         lead = leads_data[idx]
                         eval_res = eval_results[idx]
-                        search_target = eval_res.clean_company_name or lead.registered_company or lead.company
+                        search_target = eval_res.clean_company_name or lead.registered_company
 
                         tyc_info = await tyc_enricher.search_and_enrich(tyc_page, search_target)
 
@@ -521,10 +534,10 @@ async def run_pipeline(
                 finally:
                     await tyc_page.close()
         else:
-            print(f"\n🏢 [Enrichment 2/2] 所有符合条件的商户触点均已齐全，跳过天眼查检索。")
+            print(f"\n🏢 [Enrichment 2/2] 无需天眼查补全或商户无大陆主体，安全跳过。")
 
-    # 5. 组装行数据并导出 Excel 报表
-    print(f"\n📊 [数据整理与导出] 正在组织字段写入 Excel 报表...")
+    # 4. 组装与导出 Excel
+    print(f"\n📊 [数据整理与导出] 正在写入 Excel 报表...")
     new_rows = []
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -532,11 +545,12 @@ async def run_pipeline(
         official_site = lead.official_website or ""
         icp_status = enrich_res.get("icp", "无") if official_site else "无"
 
+        # 中文名绝不瞎编：有就有，没有保持留空
         company_chinese = (
             enrich_res.get("registered_company")
             or eval_res.clean_company_name
             or lead.registered_company
-            or lead.company
+            or ""
         )
         company_address = lead.registered_address or enrich_res.get("registered_address") or ""
 
