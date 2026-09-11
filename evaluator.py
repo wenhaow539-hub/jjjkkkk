@@ -1,4 +1,5 @@
 import json
+import re
 import httpx
 from models import RawSupplierLead, LLMEvalResult
 
@@ -17,7 +18,7 @@ PROMPT_TEMPLATE = """
 1. 实体工厂：注册公司通常带“制造、科技、五金、塑料、电子”等，地址处于工业园/工业区/厂房，展厅产品高度聚焦垂直。
 2. 贸易中介：公司带“进出口、贸易、商业、商行”，地址在商业写字楼，产品线杂乱跨界。
 
-请输出严格的 JSON 格式，字段必须与以下一致：
+请输出严格的 JSON 格式：
 {{
   "is_direct_factory": bool,
   "icp_score": int (1-10),
@@ -28,37 +29,53 @@ PROMPT_TEMPLATE = """
 """
 
 
-async def evaluate_supplier_icp(lead: RawSupplierLead, api_key: str, base_url: str = "https://api.deepseek.com") -> LLMEvalResult:
-    """调用轻量大模型做 ICP 匹配与身份去杂"""
+async def evaluate_supplier_icp(
+    lead: RawSupplierLead,
+    api_key: str,
+    base_url: str = "https://api.deepseek.com",
+    model: str = "deepseek-chat"
+) -> LLMEvalResult:
+    """调用大模型做 ICP 匹配与源头工厂身份核验"""
+    if not api_key or api_key.strip() in ["*", "sk-placeholder", ""]:
+        return LLMEvalResult(
+            is_direct_factory=True,
+            icp_score=6,
+            disqualify_reason=None,
+            core_competence=lead.card_product or "未配置有效 API Key，走基础规则",
+            clean_company_name=lead.registered_company or lead.company
+        )
+
     prompt = PROMPT_TEMPLATE.format(
         company=lead.company,
-        registered_company=lead.registered_company,
-        registered_address=lead.registered_address,
-        raw_products=lead.raw_products,
-        detail_content=lead.detail_content[:1500],
-        card_product=lead.card_product
+        registered_company=lead.registered_company or "未公开",
+        registered_address=lead.registered_address or "未公开",
+        raw_products=lead.raw_products or lead.card_product or "无",
+        detail_content=(lead.detail_content or "")[:1500],
+        card_product=lead.card_product or "通用外贸采购"
     )
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(
-                f"{base_url}/chat/completions",
+                f"{base_url.rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json={
-                    "model": "deepseek-chat",
+                    "model": model,
                     "messages": [{"role": "user", "content": prompt}],
-                    "response_format": {"type": "json_object"}
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.2
                 }
             )
-            result = resp.json()["choices"][0]["message"]["content"]
-            parsed = json.loads(result)
+            raw_text = resp.json()["choices"][0]["message"]["content"]
+            # 过滤 Markdown 包裹代码块
+            clean_json = re.sub(r'^```json\s*|\s*```$', '', raw_text.strip(), flags=re.MULTILINE)
+            parsed = json.loads(clean_json)
             return LLMEvalResult(**parsed)
     except Exception as e:
-        # LLM 熔断托底策略
         return LLMEvalResult(
             is_direct_factory=True,
             icp_score=5,
-            disqualify_reason=f"LLM质检异常兜底: {e}",
-            core_competence=lead.card_product,
+            disqualify_reason=f"LLM 降级兜底: {str(e)[:50]}",
+            core_competence=lead.card_product or "通用外贸产品",
             clean_company_name=lead.registered_company or lead.company
         )
