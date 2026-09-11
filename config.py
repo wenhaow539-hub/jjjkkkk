@@ -1,7 +1,7 @@
 import os
 
 # 直接填入最新生成的有效 Key (不要加首尾空格)
-OPENAI_API_KEY = "*"
+OPENAI_API_KEY = "sk-78496c7a6eaa452b9edb123f2c4186fe"
 OPENAI_BASE_URL = "https://api.deepseek.com"
 MODEL_NAME = "deepseek-chat"
 

@@ -1,32 +1,15 @@
+import asyncio
 import json
-import re
-import httpx
-from models import RawSupplierLead, LLMEvalResult
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+from models import RawSupplierLead
 
-PROMPT_TEMPLATE = """
-你是一名资深的外贸采购供应链总监。请依据下方的供应商平台采集信息，分析该商户是否符合【源头实体制造工厂】画像，淘汰纯外贸中介/无自营产能的贸易商。
 
-【供应商信息】：
-- 店铺名称: {company}
-- 法定注册公司: {registered_company}
-- 经营地址: {registered_address}
-- 展厅产品组: {raw_products}
-- 档案详情: {detail_content}
-- 目标采购类目: {card_product}
-
-【判定原则】：
-1. 实体工厂：注册公司通常带“制造、科技、五金、塑料、电子”等，地址处于工业园/工业区/厂房，展厅产品高度聚焦垂直。
-2. 贸易中介：公司带“进出口、贸易、商业、商行”，地址在商业写字楼，产品线杂乱跨界。
-
-请输出严格的 JSON 格式：
-{{
-  "is_direct_factory": bool,
-  "icp_score": int (1-10),
-  "disqualify_reason": "淘汰原因或null",
-  "core_competence": "核心主打优势(30字内)",
-  "clean_company_name": "清洗后的法定名称"
-}}
-"""
+class EvaluatedSupplier(BaseModel):
+    clean_company_name: str = ""
+    is_factory: bool = True
+    confidence_score: float = 1.0
+    summary: str = ""
 
 
 async def evaluate_supplier_icp(
@@ -34,48 +17,59 @@ async def evaluate_supplier_icp(
     api_key: str,
     base_url: str = "https://api.deepseek.com",
     model: str = "deepseek-chat"
-) -> LLMEvalResult:
-    """调用大模型做 ICP 匹配与源头工厂身份核验"""
-    if not api_key or api_key.strip() in ["*", "sk-placeholder", ""]:
-        return LLMEvalResult(
-            is_direct_factory=True,
-            icp_score=6,
-            disqualify_reason=None,
-            core_competence=lead.card_product or "未配置有效 API Key，走基础规则",
-            clean_company_name=lead.registered_company or lead.company
-        )
-
-    prompt = PROMPT_TEMPLATE.format(
-        company=lead.company,
-        registered_company=lead.registered_company or "未公开",
-        registered_address=lead.registered_address or "未公开",
-        raw_products=lead.raw_products or lead.card_product or "无",
-        detail_content=(lead.detail_content or "")[:1500],
-        card_product=lead.card_product or "通用外贸采购"
+) -> EvaluatedSupplier:
+    """
+    大模型质检：规范已有中文名，严禁根据共享办公地址臆测公司名
+    """
+    fallback_name = lead.registered_company or ""
+    default_result = EvaluatedSupplier(
+        clean_company_name=fallback_name,
+        is_factory=True,
+        confidence_score=0.8,
+        summary="未执行大模型质检或降级回退"
     )
 
+    if not api_key or "your" in api_key.lower() or api_key.strip() == "":
+        return default_result
+
+    prompt = f"""你是一个严谨的外贸B2B工商数据审计员。请根据提供的商户信息，提炼其中国大陆工商局登记的标准法定中文全称。
+
+【输入信息】：
+- 商户英文名: {lead.company}
+- 平台登记中文名: {lead.registered_company}
+- 注册地址: {lead.registered_address}
+- 官网网址: {lead.official_website}
+
+【严格执行规则】：
+1. 如果【平台登记中文名】已有内容，仅做规范化清洗（去除多余空格与标点）。
+2. 如果【平台登记中文名】为空：
+   - 严禁根据【注册地址】推测、联想或编造任何公司！因为写字楼/孵化器地址存在成百上千家共用企业！
+   - 除非英文名是极其明确的汉语拼音（如 "Shenzhen BYD Technology" -> "比亚迪"），否则必须直接输出空字符串 ""！
+3. 宁可留空，绝不能张冠李戴。
+
+请返回严格的 JSON 格式：
+{{
+  "clean_company_name": "清洗后的标准中文全称，若无法100%确定必须输出空字符串\"\"",
+  "is_factory": true或false,
+  "confidence_score": 0.0到1.0的置信度,
+  "summary": "判定依据"
+}}
+"""
+
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                f"{base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.2
-                }
-            )
-            raw_text = resp.json()["choices"][0]["message"]["content"]
-            # 过滤 Markdown 包裹代码块
-            clean_json = re.sub(r'^```json\s*|\s*```$', '', raw_text.strip(), flags=re.MULTILINE)
-            parsed = json.loads(clean_json)
-            return LLMEvalResult(**parsed)
-    except Exception as e:
-        return LLMEvalResult(
-            is_direct_factory=True,
-            icp_score=5,
-            disqualify_reason=f"LLM 降级兜底: {str(e)[:50]}",
-            core_competence=lead.card_product or "通用外贸产品",
-            clean_company_name=lead.registered_company or lead.company
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=12.0)
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "你是一个严谨的工商实体画像提取专家，只输出合法 JSON。"},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0
         )
+        content = response.choices[0].message.content
+        data = json.loads(content)
+        return EvaluatedSupplier(**data)
+    except Exception as e:
+        print(f"      ⚠️ [LLM 质检跳过] {lead.company} 请求异常: {e}")
+        return default_result
