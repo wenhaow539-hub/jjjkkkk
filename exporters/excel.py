@@ -1,28 +1,40 @@
 from datetime import datetime
 import os
-from openpyxl.styles import Alignment, PatternFill
+from openpyxl.styles import Alignment
 import pandas as pd
 
-from utils.logger import get_logger
-
-logger = get_logger("export")
-
 TARGET_COLUMNS = [
-    "平台名称", "公司英文名", "平台网址", "公司中文名", "公司注册地址",
-    "天眼查联系人", "天眼查联系人职位", "独立站", "网址是否有备案",
-    "官网联系方式", "天眼查联系方式", "搜索的关键词", "email", "入库时间"
+    "平台名称",
+    "公司英文名",
+    "平台网址",
+    "公司中文名",
+    "注册资本",
+    "实缴资本",
+    "参保人数",
+    "公司注册地址",
+    "天眼查联系人",
+    "天眼查联系人职位",
+    "独立站",
+    "网址是否有备案",
+    "官网联系方式",
+    "天眼查联系方式",
+    "搜索的关键词",
+    "email",
+    "入库时间",
 ]
+
 
 def export_leads_to_excel(
     leads_data: list,
     enriched_results: list,
     eval_results: list,
     keyword: str,
-    output_file: str = "suppliers_leads.xlsx"
+    output_file: str = "suppliers_leads.xlsx",
 ) -> str:
-    logger.info(f"\n📊 [数据整理与导出] 正在写入 Excel 报表...")
+    print("\n📊 [数据整理与导出] 正在写入 Excel 报表...")
+
     new_rows = []
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fallback_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for lead, enrich_res, eval_res in zip(leads_data, enriched_results, eval_results):
         official_site = lead.official_website or ""
@@ -35,12 +47,16 @@ def export_leads_to_excel(
             or ""
         )
         company_address = lead.registered_address or enrich_res.get("registered_address") or ""
+        record_time = enrich_res.get("created_at") or fallback_time
 
         new_rows.append({
             "平台名称": lead.platform,
             "公司英文名": lead.company,
             "平台网址": lead.store_url,
             "公司中文名": company_chinese,
+            "注册资本": enrich_res.get("registered_capital", "未公开"),
+            "实缴资本": enrich_res.get("paid_in_capital", "未公开"),
+            "参保人数": enrich_res.get("insured_count", "未公开"),
             "公司注册地址": company_address,
             "天眼查联系人": enrich_res.get("contact_person", ""),
             "天眼查联系人职位": enrich_res.get("contact_title", ""),
@@ -50,7 +66,7 @@ def export_leads_to_excel(
             "天眼查联系方式": enrich_res.get("tyc_phone", ""),
             "搜索的关键词": keyword,
             "email": enrich_res.get("email", ""),
-            "入库时间": current_time
+            "入库时间": record_time,
         })
 
     new_df = pd.DataFrame(new_rows)[TARGET_COLUMNS]
@@ -63,27 +79,18 @@ def export_leads_to_excel(
             for col in TARGET_COLUMNS:
                 if col not in old_df.columns:
                     old_df[col] = ""
+
+            # 关键改动：old_df 在前，keep="first"，用户手工修改的数据绝对不被爬虫冲掉！
             merged_df = pd.concat([old_df[TARGET_COLUMNS], new_df], ignore_index=True)
-            merged_df.drop_duplicates(subset=["平台网址"], keep="last", inplace=True)
+            merged_df.drop_duplicates(subset=["平台网址"], keep="first", inplace=True)
             final_df = merged_df[TARGET_COLUMNS]
-        except Exception as e:
-            # 数据保护（P1 修复）：原逻辑此处静默丢弃全部历史数据，
-            # 现改为先把损坏文件备份移走，历史数据永远不删，事后可人工抢救合并。
-            backup_path = f"{output_file}.{int(datetime.now().timestamp())}.bak"
-            try:
-                os.replace(output_file, backup_path)
-                logger.error(
-                    f"⚠️ [数据保护] 读取历史报表失败({e!r})，原文件已备份至 {backup_path}，"
-                    f"本次仅写入新数据（历史数据完整保留在备份中，请人工检查后合并）。"
-                )
-            except OSError:
-                logger.error(
-                    f"⚠️ [数据保护] 读取历史报表失败({e!r})，且备份原文件失败！"
-                    f"请立即人工检查 {output_file}，避免历史数据丢失。"
-                )
+            added_count = len(final_df) - len(old_df)
+        except Exception:
             final_df = new_df
+            added_count = len(new_df)
     else:
         final_df = new_df
+        added_count = len(new_df)
 
     target_path = output_file
     try:
@@ -92,19 +99,19 @@ def export_leads_to_excel(
                 pass
     except PermissionError:
         target_path = f"suppliers_leads_{int(datetime.now().timestamp())}.xlsx"
-        logger.warning(f"⚠️ [占用警告] 原文件被占用，已重定向写入至: {target_path}")
+        print(f"⚠️ [占用警告] 原文件被占用，已重定向写入至: {target_path}")
 
     with pd.ExcelWriter(target_path, engine="openpyxl") as writer:
         final_df.to_excel(writer, index=False, sheet_name="Suppliers")
         ws = writer.sheets["Suppliers"]
-        header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+
         for cell in ws[1]:
-            cell.fill = header_fill
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
         text_cols = [
             "官网联系方式", "天眼查联系方式", "email", "入库时间",
-            "公司注册地址", "平台网址", "独立站", "网址是否有备案"
+            "公司注册地址", "平台网址", "独立站", "网址是否有备案",
+            "注册资本", "实缴资本", "参保人数",
         ]
         for col_idx, col_name in enumerate(final_df.columns, start=1):
             is_text = col_name in text_cols
@@ -116,6 +123,6 @@ def export_leads_to_excel(
                     if cell.value is not None:
                         cell.value = str(cell.value)
 
-    logger.info(f"\n🎉 [流水线完成] 数据已入库: {target_path}")
-    logger.info(f"📈 累计总商户: {len(final_df)} 条 (本次追加: {len(new_df)} 条)")
+    print(f"\n🎉 [流水线完成] 数据已入库: {target_path}")
+    print(f"📈 累计总商户: {len(final_df)} 条 (本次真正新增入库: {max(0, added_count)} 条)")
     return target_path

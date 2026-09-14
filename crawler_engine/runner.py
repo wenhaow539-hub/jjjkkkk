@@ -30,7 +30,7 @@ import hashlib
 import inspect
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlparse
@@ -40,6 +40,90 @@ from crawler_engine.middleware import build_crawlee_middleware_kwargs
 from utils.logger import get_logger
 
 logger = get_logger("engine.runner")
+
+# 这两条是 crawlee 在"没启用 ThrottlingRequestManager"时打的提示。
+# 对本项目已经过时甚至会误导读日志的人：
+#   1) crawl-delay —— 引擎已经自己实现（见 CrawlerRunner.resolve_pacing），并非"没人执行"；
+#   2) 隐式创建 event manager —— 引擎已显式创建并注入（见 _ensure_services），不应再出现。
+# 用日志过滤器屏蔽掉，保留其余 crawlee 日志（例如真实的 429 告警）。
+_CRAWLEE_NOISE = (
+    "Crawl-delay directives from robots.txt will not be enforced",
+    "Implicit creation of event manager",
+    "Implicit creation of storage client",
+)
+
+
+class _CrawleeNoiseFilter:
+    """按消息关键字丢弃 crawlee 的过时提示，避免干扰真正需要关注的日志。"""
+
+    def filter(self, record) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not any(noise in message for noise in _CRAWLEE_NOISE)
+
+
+def _install_crawlee_noise_filter() -> None:
+    """把噪声过滤器挂到所有可能输出 crawlee 记录的地方。
+
+    logging 的语义坑：挂在父 logger 上的 filter **不会**作用于子 logger 产生的记录；
+    而本项目自己的日志器是 `jjkk`（propagate=False），crawlee 的记录往上冒泡后
+    没有匹配的 handler，最终落到 root 的 `lastResort`（它不在 root.handlers 里）。
+    因此三种目标都要挂：logger 本身、其 handler、以及 lastResort。
+    """
+    import logging as _logging
+
+    targets: list = []
+    root = _logging.getLogger()
+    targets += [root, *root.handlers]
+    last_resort = getattr(_logging, "lastResort", None)
+    if last_resort is not None:
+        targets.append(last_resort)
+    for name, obj in list(_logging.Logger.manager.loggerDict.items()):
+        if isinstance(obj, _logging.Logger) and name.startswith("crawlee"):
+            targets += [obj, *obj.handlers]
+
+    for target in targets:
+        add_filter = getattr(target, "addFilter", None)
+        if add_filter is None:
+            continue
+        if not any(isinstance(f, _CrawleeNoiseFilter) for f in getattr(target, "filters", ())):
+            add_filter(_CrawleeNoiseFilter())
+
+
+_SERVICES_READY = False
+
+
+def _ensure_services(config: EngineConfig) -> Any:
+    """显式初始化 crawlee 的全局 Configuration / EventManager。
+
+    必须在"打开任何存储"之前调用：crawlee 在被首次使用时若发现这些为空会隐式创建并打印告警
+    （实测出现在 open_queue 之前）。显式创建后行为一致但没有噪声，也不会因隐式创建
+    而隐性覆盖我们传入的 configuration。
+    注意 crawlee 只允许设置一次全局 Configuration，重复调用会抛 ServiceConflictError，
+    此时复用已有的即可（本次执行仍以显式传入的 configuration= 为准）。
+    """
+    global _SERVICES_READY
+
+    from crawlee import service_locator
+    from crawlee.events import LocalEventManager
+
+    _install_crawlee_noise_filter()
+
+    configuration = config.to_configuration()
+    try:
+        service_locator.set_configuration(configuration)
+    except Exception as e:
+        logger.debug(f"[runner] 全局 Configuration 已存在({e.__class__.__name__})，本次沿用显式参数。")
+
+    if not _SERVICES_READY:
+        try:
+            service_locator.set_event_manager(LocalEventManager())
+            _SERVICES_READY = True
+        except Exception as e:
+            logger.debug(f"[runner] EventManager 初始化跳过: {e.__class__.__name__}")
+    return configuration
 
 ENGINE_MODES = ("auto", "http", "soup", "browser", "browser-cdp", "legacy")
 
@@ -90,11 +174,85 @@ def _stat(stats: Any, *names: str, default: int = 0) -> int:
     return default
 
 
+def _first_url(items: Sequence[Any] | None) -> str:
+    """从起始请求里取出第一个可用的 URL 字符串（用于 robots/crawl-delay 解析）。"""
+    for item in items or ():
+        raw = getattr(item, "url", item)
+        if isinstance(raw, str) and raw.startswith("http"):
+            return raw
+    return ""
+
+
 class CrawlerRunner:
     """Crawlee 统一执行入口。"""
 
     def __init__(self, config: EngineConfig | None = None) -> None:
         self.config = config or EngineConfig.from_env()
+
+    # ------------------------------------------------------------------ #
+    # 0) 请求节奏：服从 robots.txt 的 Crawl-delay
+    # ------------------------------------------------------------------ #
+    async def resolve_pacing(self, config: EngineConfig, urls: Sequence[Any] | None) -> EngineConfig:
+        """按 robots.txt 声明的 Crawl-delay 调整请求节奏，返回（可能是新的）配置。
+
+        为什么必须自己做：crawlee 只在启用 `ThrottlingRequestManager` 时才会执行 crawl-delay，
+        否则仅打印一条"不会被强制执行"的提示；而该组件在本项目的"处理中动态入队"场景会提前
+        结束爬取、与 keep_alive 组合还会挂死，所以保持关闭。结果是**这条保护实际没人执行**：
+        实测 Global Sources 的 robots.txt 对具名爬虫声明 Crawl-delay: 10~20 秒，
+        而我们跑到约 1.67 请求/秒，随即被 429/403 连续拒绝。
+
+        robots 未声明时不做任何改动（沿用 min_request_interval），失败也绝不阻断抓取。
+        """
+        if not (config.respect_robots and config.respect_crawl_delay):
+            logger.info(
+                f"⏳ [pacing] 已关闭 crawl-delay 服从（--no-crawl-delay），请求间隔 {config.effective_interval():.1f}s。"
+            )
+            return config
+
+        url = _first_url(urls)
+        if not url:
+            return config
+
+        from utils.robots import resolve_crawl_delays
+
+        from crawler_engine.middleware import DEFAULT_USER_AGENT
+
+        host = urlparse(url).netloc
+        declared, bot_hint = await resolve_crawl_delays(url, user_agent=DEFAULT_USER_AGENT)
+        base = max(float(config.min_request_interval), 0.05)
+
+        if not declared:
+            if bot_hint:
+                # 站点只对具名爬虫声明了间隔——那不是对我们的约束，但值得知道，
+                # 因为它是判断"多快算太快"唯一的客观依据（GS 的检索页与详情子域都是 10s）。
+                logger.info(
+                    f"⏳ [pacing] {host} 未对本客户端声明 crawl-delay"
+                    f"（仅对具名爬虫声明 {bot_hint:g}s）→ 使用自身间隔 {base:.1f}s"
+                    f"（约 {60 / base:.1f} 请求/分钟）。若遇到 429/403，请用 "
+                    f"--interval {max(bot_hint, base):g} 放慢到站点对具名爬虫的口径。"
+                )
+            else:
+                logger.info(
+                    f"⏳ [pacing] {host} 未声明 crawl-delay，使用自身间隔 {base:.1f}s"
+                    f"（约 {60 / base:.1f} 请求/分钟）。"
+                )
+            # 必须能"重置"：本方法按批次的 URL 主机解析，换到没声明的域时要退回自身间隔，
+            # 否则会把上一个域要求的长间隔带到这批 URL 上，白慢好几倍。
+            return replace(config, request_interval=None)
+
+        interval = max(base, float(declared))
+        if config.max_crawl_delay and interval > float(config.max_crawl_delay):
+            logger.warning(
+                f"⚠️ [pacing] {host} 声明 Crawl-delay={declared:g}s，"
+                f"但被 max_crawl_delay={config.max_crawl_delay:g}s 封顶 → **未完全遵守**，请自行确认合规。"
+            )
+            interval = float(config.max_crawl_delay)
+
+        logger.warning(
+            f"⏳ [pacing] {host} 声明 Crawl-delay={declared:g}s → 请求间隔 {interval:.1f}s"
+            f"（约 {60 / interval:.1f} 请求/分钟）。crawl-delay 是按主机声明的约束，必须遵守。"
+        )
+        return replace(config, request_interval=interval)
 
     # ------------------------------------------------------------------ #
     # 1) Crawlee handler 模式
@@ -126,24 +284,42 @@ class CrawlerRunner:
                 raise  # 交回 Crawlee 计数与重试
 
         payload = list(requests) if requests else list(start_urls or ())
+        # 请求节奏：服从 robots.txt 声明的 Crawl-delay（必须在构建 crawler 之前解析）
+        config = await self.resolve_pacing(config, payload)
         crawler = await self._build_crawler(resolved, wrapped, config, payload,
                                             pre_navigation_hooks=pre_navigation_hooks)
+        _install_crawlee_noise_filter()  # crawler 已建好，其自身 logger 此时才存在于 registry 中
         logger.info(f"🧭 [runner] 启动 Crawlee 模式={resolved} | {config.describe(resolved)}")
         logger.info(f"🧭 [runner] 起始请求数: {len(payload)}")
+        memory_hint = config.memory_guard_message()
+        if memory_hint:
+            logger.warning(f"⚠️ [runner] {memory_hint}")
 
         started = time.perf_counter()
-        stats = await crawler.run(payload)
+        run_error: str | None = None
+        stats = None
+        try:
+            stats = await crawler.run(payload)
+        except Exception as e:
+            # 与 CrawlRunner 一致：浏览器被系统压死 / 站点封禁等不应裸崩，而是记录后正常返回
+            run_error = f"{type(e).__name__}: {e}"
+            errors.append(run_error)
+            logger.error(f"❌ [runner] 爬取过程异常终止: {run_error}")
         duration = time.perf_counter() - started
 
         result = RunResult(
             mode=resolved,
             status="ok" if not errors else "partial",
-            requests_total=_stat(stats, "requests_total", "requests_total_count", default=len(payload)),
+            requests_total=_stat(stats, "requests_total", "requests_total_count",
+                                 default=max(len(payload), 0)),
             requests_finished=_stat(stats, "requests_finished", "requests_finished_count"),
-            requests_failed=_stat(stats, "requests_failed", "requests_failed_count"),
+            requests_failed=_stat(stats, "requests_failed", "requests_failed_count",
+                                  default=1 if run_error else 0),
             duration_s=duration,
             errors=errors,
         )
+        if run_error and result.requests_finished == 0:
+            result.status = "failed"
         logger.info(f"✅ [runner] Crawlee 执行完成: {result.summary()}")
         return result
 
@@ -153,18 +329,14 @@ class CrawlerRunner:
         from crawlee import service_locator
 
         config.validate()  # 组合校验：拦下实测会挂死/丢数据的配置组合
-        kwargs = config.to_crawlee_kwargs()
-        configuration = kwargs.pop("configuration")
-        # 显式注入配置与事件管理器：避免 crawlee 隐式创建带来的副作用与告警。
-        # 注意：crawlee 的 service_locator 只允许设置一次全局 Configuration，
-        # 同进程内第二次构建（例如批处理多个 runner）会冲突，此时复用已有全局配置，
-        # 本次执行仍以显式传入的 configuration= 为准，行为不受影响。
-        try:
-            service_locator.set_configuration(configuration)
-        except Exception as e:
-            logger.debug(f"[runner] 全局 Configuration 已存在({e.__class__.__name__})，本次沿用显式 configuration 参数。")
-        kwargs["configuration"] = configuration
+        kwargs = config.to_crawlee_kwargs(mode)  # 传 mode：浏览器模式按 browser_max_concurrency 收敛并发
+        kwargs["configuration"] = _ensure_services(config)
         kwargs["event_manager"] = service_locator.get_event_manager()
+        # 统计对象按"本次运行"新建且不持久化：
+        # crawlee 的统计默认会落到 storage 并在下次运行读回，导致第二次运行显示上一次的成功数（实测误导）。
+        from crawlee.statistics import Statistics
+
+        kwargs["statistics"] = Statistics.with_default_state(persistence_enabled=False)
         kwargs.update(build_crawlee_middleware_kwargs(config))
 
         request_manager = await self._build_request_manager(config, start_urls, queue=queue)
@@ -185,11 +357,12 @@ class CrawlerRunner:
             from crawlee.crawlers import PlaywrightCrawler
 
             from crawler_engine.browser import build_crawler_browser_kwargs, build_pre_navigation_hook
+            from crawler_engine.middleware import build_pacing_limiter
 
             kwargs.update(build_crawler_browser_kwargs(config))
             crawler = PlaywrightCrawler(request_handler=handler, **kwargs)
-            # 浏览器层处理（反侦测补丁 / 资源拦截）由引擎统一注入，Adapter 内不得出现
-            crawler.pre_navigation_hook(build_pre_navigation_hook(config))
+            # 浏览器层处理（请求节奏 / 反侦测补丁 / 资源拦截）由引擎统一注入，Adapter 内不得出现
+            crawler.pre_navigation_hook(build_pre_navigation_hook(config, build_pacing_limiter(config)))
             # 调用方附加的钩子（例如接口发现的响应监听器：导航前挂上才能捕获首屏请求）
             for hook in (pre_navigation_hooks or ()):
                 crawler.pre_navigation_hook(hook)
@@ -199,10 +372,32 @@ class CrawlerRunner:
 
     @staticmethod
     async def open_queue(config: EngineConfig):
-        """打开（或创建）Request Queue；配置了 queue_name 时为命名队列，可跨运行保留。"""
+        """打开（或创建）Request Queue；配置了 queue_name 时为命名队列，可跨运行保留。
+
+        显式传入 storage_client 与 configuration：否则 crawlee 会"隐式创建存储客户端"，
+        触发告警并有覆盖本次 configuration 的副作用。
+
+        注意：Configuration.purge_on_start 只对 crawlee 内部打开默认队列的路径生效，
+        我们这里是显式 open，所以要自己按 resolved_purge_on_start() 清空，
+        否则匿名队列会带着上一次的"已处理"记录跨运行去重，导致第二次运行空跑。
+        """
+        from crawlee.storage_clients import FileSystemStorageClient
         from crawlee.storages import RequestQueue
 
-        return await RequestQueue.open(name=config.queue_name, configuration=config.to_configuration())
+        queue = await RequestQueue.open(
+            name=config.queue_name,
+            configuration=config.to_configuration(),
+            storage_client=FileSystemStorageClient(),
+        )
+        if config.resolved_purge_on_start():
+            try:
+                purged = queue.purge()
+                if inspect.isawaitable(purged):
+                    await purged
+                logger.debug("[runner] 已清空队列（匿名队列默认每次运行清空）")
+            except Exception as e:
+                logger.warning(f"⚠️ [runner] 清空队列失败（忽略，继续）: {e!r}")
+        return queue
 
     async def _build_request_manager(self, config: EngineConfig, start_urls: Sequence[Any] | None,
                                      queue: Any = None):
@@ -449,15 +644,22 @@ class CrawlRunner:
         from crawlee import Request
 
         urls, handler = await self._prepare_adapter(adapter)
+        # 请求节奏：服从 robots.txt 声明的 Crawl-delay（必须在构建 crawler 之前解析，
+        # 否则 max_tasks_per_minute 与导航前限速器都会用到旧的间隔）。
+        self.config = await self._runner.resolve_pacing(self.config, urls)
+        _ensure_services(self.config)  # 必须在 open_queue 之前：避免 crawlee 隐式创建全局配置
         resolved = mode or getattr(adapter, "engine_mode", None) or self.config.resolved_mode()
 
-        # 契约校验：声明 requires_browser=True 的 adapter 依赖 context.page，
-        # 在 http / soup 模式下必然 AttributeError，这里提前纠正模式而不是让每个请求都失败。
-        if getattr(adapter, "requires_browser", None) is True and resolved in ("http", "soup"):
+        # 契约校验：**按这批 URL** 判断是否需要浏览器。
+        # 用类级 requires_browser 判断过粗：像 GlobalSourcesAdapter 只有检索页需要 JS，
+        # 资料页可以用 HTTP（快 5 倍以上）。按 URL 判断后，"检索页走浏览器、详情页走 HTTP"
+        # 这类混合策略才不会被误纠正。
+        needs_browser = any(self._needs_browser(adapter, u) for u in urls)
+        if needs_browser and resolved in ("http", "soup"):
             fallback = self.config.resolved_mode()
             logger.warning(
-                f"⚠️ [CrawlRunner] {adapter.__class__.__name__} 声明 requires_browser=True，"
-                f"与模式 {resolved} 冲突，已自动切换到 {fallback}。"
+                f"⚠️ [CrawlRunner] 这批起始 URL 需要浏览器上下文（{adapter.__class__.__name__}."
+                f"requires_browser_for() 为 True），与模式 {resolved} 冲突，已自动切换到 {fallback}。"
             )
             resolved = fallback
         if resolved == "legacy":
@@ -466,6 +668,12 @@ class CrawlRunner:
         logger.info(
             f"🔧 [CrawlRunner] adapter={adapter.__class__.__name__} | {self.config.describe(resolved)}"
         )
+
+        # 内存预警：浏览器模式在内存紧张时会被系统压死 Chrome，导致整轮抓取失败（实测）。
+        # 与其崩溃后排查，不如启动前提示。
+        memory_hint = self.config.memory_guard_message()
+        if memory_hint:
+            logger.warning(f"⚠️ [CrawlRunner] {memory_hint}")
 
         # —— 职责 2：Request Queue 管理（显式打开 + 入队，不依赖隐式队列）——
         self.queue = await CrawlerRunner.open_queue(self.config)
@@ -503,10 +711,42 @@ class CrawlRunner:
 
         # —— 职责 1 + 3：创建 crawler（并发/限速/会话/代理/按域限速均由配置统一注入）——
         crawler = await self._runner._build_crawler(resolved, wrapped, self.config, urls, queue=self.queue)
+        _install_crawlee_noise_filter()  # crawler 已建好，其自身 logger 此时才存在于 registry 中
 
         started = time.perf_counter()
-        stats = await crawler.run(purge_request_queue=False)
+        run_error: str | None = None
+        stats = None
+        try:
+            stats = await crawler.run(purge_request_queue=False)
+        except Exception as e:
+            # 崩溃兜底：浏览器被系统压死 / 驱动连接断开（BrowserContext.close: Connection closed
+            # while reading from the driver）、站点长时间 429/403 等，都会在这里抛出。
+            # 以前会直接裸崩（traceback + 退出码 1），已经采到的数据全部丢失且看不出原因。
+            # 现在只记录错误，继续走完 flush / 结果收集，让已采集的数据正常产出。
+            run_error = f"{type(e).__name__}: {e}"
+            errors.append(run_error)
+            logger.error(f"❌ [CrawlRunner] 爬取过程异常终止: {run_error}")
+            logger.error(
+                "   常见原因：① 内存不足导致浏览器进程被系统压死（看上面的内存预警，可加 --concurrency 1）；"
+                "② 站点限流/封禁（429/403，建议降低并发或换 --cdp-url 附着已登录浏览器）；"
+                "③ 页面导航被中断。已采集到的数据仍会正常输出。"
+            )
         duration = time.perf_counter() - started
+        totals = {
+            "total": _stat(stats, "requests_total", default=max(len(urls), int(getattr(adapter, "pages_handled", 0) or 0))),
+            "finished": _stat(stats, "requests_finished", default=int(getattr(adapter, "pages_handled", 0) or 0)),
+            "failed": _stat(stats, "requests_failed", default=1 if run_error else 0),
+        }
+
+        # —— 阶段 2：把"不需要 JS"的 URL 改用 HTTP 抓取 ——
+        phase2 = await self._run_http_phase(adapter, wrapped, errors)
+        if phase2 is not None:
+            stats2, seconds2, error2 = phase2
+            duration += seconds2
+            run_error = run_error or error2
+            totals["total"] += _stat(stats2, "requests_total", default=0)
+            totals["finished"] += _stat(stats2, "requests_finished", default=0)
+            totals["failed"] += _stat(stats2, "requests_failed", default=0)
 
         # 给 Adapter 一次补出机会：处理了部分页面但未凑齐的商户记录，在此统一输出
         flush = getattr(adapter, "flush", None)
@@ -522,13 +762,14 @@ class CrawlRunner:
 
         remaining = await self._queue_pending(self.queue)
 
+        pages_done = int(getattr(adapter, "pages_handled", 0) or 0)
         result = RunResult(
             mode=resolved,
             platform=getattr(adapter, "platform_name", adapter.__class__.__name__),
             status="ok" if not errors else "partial",
-            requests_total=_stat(stats, "requests_total", default=len(urls)),
-            requests_finished=_stat(stats, "requests_finished"),
-            requests_failed=_stat(stats, "requests_failed"),
+            requests_total=max(totals["total"], pages_done),
+            requests_finished=max(totals["finished"], pages_done),
+            requests_failed=totals["failed"],
             duration_s=duration,
             errors=errors,
         )
@@ -541,6 +782,26 @@ class CrawlRunner:
         adapter_summary = getattr(adapter, "summary", None)
         if callable(adapter_summary):
             logger.info(f"📦 [{adapter.__class__.__name__}] {adapter_summary()}")
+
+        # 空跑诊断：请求被队列去重跳过时，Crawlee 会直接判定"完成"而不调用 handler，
+        # 表现为"跑了但 0 页 0 记录"，很容易被误读为抓取成功。
+        if pages_done == 0 and not run_error:
+            logger.warning(
+                "⚠️ [CrawlRunner] 本次没有任何页面进入 handler。最常见原因：请求命中了队列去重"
+                "（该 URL 在持久化队列中已被处理）。默认队列已配置为每次运行清空；"
+                "若你在用 --queue 命名队列，请更换队列名或清空后重试。"
+            )
+            result.status = "noop"
+
+        # 异常终止时区分两种情况：有产出 -> partial（部分成功，数据仍可用）；无产出 -> failed
+        if run_error:
+            result.status = "partial" if result.items else "failed"
+            if result.items:
+                logger.warning(
+                    f"⚠️ [CrawlRunner] 爬取中途异常，但已采集的 {result.items} 条记录仍然有效并已输出。"
+                )
+            else:
+                logger.error("❌ [CrawlRunner] 本轮未产出任何记录，请按上面的原因排查后重试。")
 
         if remaining and remaining > 0:
             logger.info(f"⏸️ [CrawlRunner] 队列仍有 {remaining} 条未处理（命名队列可下次续跑）")
@@ -566,6 +827,59 @@ class CrawlRunner:
         if handler is None:
             raise ValueError(f"{adapter.__class__.__name__} 必须实现 handle(context) 或提供 router")
         return urls, handler
+
+    @staticmethod
+    def _needs_browser(adapter, url: str) -> bool:
+        """该 URL 是否必须用浏览器（优先用 adapter 的按 URL 契约，回退到类级声明）。"""
+        fn = getattr(adapter, "requires_browser_for", None)
+        if callable(fn):
+            try:
+                return bool(fn(url))
+            except Exception:
+                pass
+        return getattr(adapter, "requires_browser", None) is True
+
+    async def _run_http_phase(self, adapter, wrapped, errors: list):
+        """阶段 2：抓取 adapter 声明"可用 HTTP"的 URL（无需浏览器）。
+
+        为什么需要这个阶段：很多站点只有列表/检索页需要 JS 渲染，详情页其实是服务端渲染的。
+        把详情页也交给浏览器，单页耗时从约 1 秒涨到约 7 秒，还会把内存拉满（实测 Chrome 被
+        系统压死、整轮失败）。legacy 爬虫原本就是"浏览器只管列表页 + httpx 抓详情"，
+        迁移时不该丢掉这个优势。
+
+        另外**单独解析**这批 URL 所在主机的 crawl-delay：crawl-delay 是按主机声明的指令，
+        用检索页那个域要求的 10 秒去卡详情页子域并不正确（实测详情页子域 robots 未声明
+        crawl-delay），那样会白白慢 5 倍以上。
+        """
+        pop = getattr(adapter, "pop_http_urls", None)
+        http_urls = list(pop() or ()) if callable(pop) else []
+        if not http_urls:
+            return None
+
+        from crawlee import Request
+
+        phase_config = await self._runner.resolve_pacing(self.config, http_urls)
+        logger.info(
+            f"⚡ [CrawlRunner] 阶段2：{len(http_urls)} 个 URL 改用 HTTP 抓取（无需浏览器）| "
+            f"间隔 {phase_config.effective_interval():.1f}s / {phase_config.effective_rate_per_minute()} 请求每分钟"
+        )
+
+        await self.queue.add_requests(
+            [Request.from_url(u) for u in http_urls],
+            wait_for_all_requests_to_be_added=True,
+        )
+        crawler = await self._runner._build_crawler("http", wrapped, phase_config, http_urls, queue=self.queue)
+        _install_crawlee_noise_filter()
+
+        started = time.perf_counter()
+        try:
+            stats = await crawler.run(purge_request_queue=False)
+            return stats, time.perf_counter() - started, None
+        except Exception as e:
+            error = f"阶段2: {type(e).__name__}: {e}"
+            errors.append(error)
+            logger.error(f"❌ [CrawlRunner] HTTP 阶段异常终止: {error}")
+            return None, time.perf_counter() - started, error
 
     @staticmethod
     async def _queue_pending(queue) -> int:
@@ -631,6 +945,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cdp-url", default=None, help="附着到已登录的 Chrome，例如 http://127.0.0.1:9222")
     parser.add_argument("--headless", action="store_true", help="无头模式（默认有头，便于人工过验证码）")
     parser.add_argument("--no-robots", action="store_true", help="关闭 robots.txt 检查（请自行确认合规）")
+    parser.add_argument("--interval", type=float, default=None,
+                        help="相邻请求最小间隔（秒）。默认 3.0，并自动服从 robots.txt 的 Crawl-delay")
+    parser.add_argument("--no-crawl-delay", action="store_true",
+                        help="不按 robots.txt 的 Crawl-delay 放慢（默认服从）")
     parser.add_argument("--proxy", action="append", default=None, help="代理 URL，可重复传入")
     parser.add_argument("--excel", default=None, help="legacy 模式下把线索导出到该 Excel 文件")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -644,6 +962,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help="重放通路：crawlee（默认，队列/重试/会话/并发托管）或 fetcher（轻量直连）")
     parser.add_argument("--replay-limit", type=int, default=None, help="重放请求数上限")
     parser.add_argument("--out", default=None, help="重放结果写入的 JSONL 路径")
+    parser.add_argument("--refresh", action="store_true",
+                        help="adapter 模式：忽略历史指纹库，强制重采已采集过的公司（默认跳过并提示）")
     return parser
 
 
@@ -679,6 +999,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         proxy_urls=tuple(args.proxy) if args.proxy else None,
         queue_name=args.queue,
         log_level=args.log_level,
+        min_request_interval=args.interval,
+        respect_crawl_delay=False if args.no_crawl_delay else None,
     )
 
     if args.selfcheck:
@@ -715,7 +1037,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1 if report.failed and not report.ok else 0
 
         if args.adapter:
-            adapter = load_adapter(args.adapter)
+            adapter = load_adapter(args.adapter, keyword=args.keyword or None,
+                                   skip_seen=not args.refresh, max_count=args.limit or None)
             result = await CrawlRunner(config).run(adapter, mode=args.engine)
             print(f"\n{result.summary()}")
             for err in result.errors[:10]:

@@ -41,6 +41,10 @@ DEFAULT_USER_AGENTS = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 )
 
+DEFAULT_USER_AGENT = DEFAULT_USER_AGENTS[0]
+"""解析 robots.txt（含 Crawl-delay）时对外声明的 UA：用常规浏览器 UA，
+以保证拿到的是"普通客户端"适用的规则，而不是某个具名爬虫的专属分组。"""
+
 
 # --------------------------------------------------------------------------- #
 # 重试
@@ -215,9 +219,30 @@ def proxy_for(config, index: int = 0) -> Optional[str]:
     return None
 
 
+def build_pacing_limiter(config):
+    """构造全站共享的请求节奏限速器（无需限速时返回 None）。
+
+    为什么需要它：crawlee 的 `max_tasks_per_minute` 只约束"任务启动速率"，
+    在并发 > 1 时并不等于"相邻请求间隔"；而真正会执行 robots crawl-delay 的
+    `ThrottlingRequestManager` 在本项目里是关闭的（它会提前结束爬取、与 keep_alive 组合会挂死）。
+    浏览器模式下由引擎在每次导航前调用 `acquire()`，让"相邻请求间隔"成为硬约束——
+    对 429 之后的重试同样生效（重试会重新走 pre_navigation_hook），避免重试放大成请求风暴。
+    """
+    from utils.ratelimit import AsyncRateLimiter
+
+    interval = config.effective_interval()
+    if interval <= 0:
+        return None
+    return AsyncRateLimiter(min_interval=interval, jitter=config.jitter)
+
+
 def build_crawlee_middleware_kwargs(config) -> dict[str, Any]:
-    """把会话池 / 代理中间件合并成可传给 crawlee 构造器的 kwargs。"""
-    kwargs: dict[str, Any] = {}
+    """把会话池 / 代理 / 重试上限合并成可传给 crawlee 构造器的 kwargs。"""
+    kwargs: dict[str, Any] = {
+        # 会话轮换次数上限：无代理时轮换不改变出口 IP，只会把同一个被拒请求反复重试
+        # （实测 429 时刷出 40+ 行 "rotating session and retrying"）。默认 1。
+        "max_session_rotations": max(int(config.session_max_rotations), 0),
+    }
     session_pool = build_session_pool(config)
     if session_pool is not None:
         kwargs["session_pool"] = session_pool

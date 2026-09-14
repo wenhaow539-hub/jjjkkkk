@@ -44,8 +44,15 @@ ADDR_LABELS = [
 ADDR_STOPS = ["zip code", "country/region", "view more", "view less", "null", "production capacity", "* in china"]
 
 CANDIDATE_SELECTOR = (
-    'a[href*="manufacturer.globalsources.com/homepage_"], a[href*="/si/"], a.company-name, a.supplier-name'
+    'a[href*="homepage_"], a[href*="/si/"], a.company-name, a.supplier-name'
 )
+"""候选商户链接选择器。
+
+特意**不写死主机名**：真实链接形如 `//<vendor>.manufacturer.globalsources.com/homepage_<id>.htm`，
+主机名前缀会随站点调整而变（写死 manufacturer.globalsources.com 在换子域时会整体失效，
+也无法用本地夹具做离线回归）。`homepage_` 这个片段足够精确：
+不会被 `.../hk-show/homepage?source=...`（问号）或 `.../home_page_eng`（下划线位置不同）误伤。
+"""
 PRODUCT_URL_MARKERS = ("/pdtl/", "/product_", "productdetail", "/product/")
 
 # 已知字段名清单：用于截断"同行串到下个标签"的粘连值。
@@ -73,14 +80,57 @@ class GlobalSourcesAdapter(BaseAdapter):
 
     SEARCH_URL = "https://www.globalsources.com/searchList/suppliers?keyWord={kw}&pageNum={page}"
     MAX_SEARCH_PAGES = 25
+    MAX_EMPTY_PAGES = 5
+    """翻页策略：按需翻页（不预先把 N 页塞进队列）。
 
-    def __init__(self, keyword: str = "", pages: int = 1):
+    起初写成了"把 1..pages 全部入队"，实测代价很大：25 个重页面（每个 1.5MB HTML + 大量 JS）
+    同时进入浏览器，直接把内存打满（crawlee 报 105%）并压死 Chrome，
+    同时因为请求过密被站点 429/403 限流。现在改为**只入队第 1 页**，
+    后续每一页由上一页处理完后再决定是否继续（见 maybe_enqueue_next_search_page）。
+    """
+
+    def __init__(self, keyword: str = "", pages: int | None = None, skip_seen: bool = True,
+                 max_count: int | None = None, max_empty_pages: int | None = None,
+                 detail_via_http: bool = True):
         super().__init__()
         self.keyword = (keyword or "").lower().replace("manufacturer", "").strip()
-        self.pages = min(max(int(pages), 1), self.MAX_SEARCH_PAGES)
+        # 翻页"上限"（不是要抓的页数）：实际翻到哪一页，由"是否找到新公司 / 是否凑够目标家数"决定
+        self.pages = min(max(int(pages or self.MAX_SEARCH_PAGES), 1), self.MAX_SEARCH_PAGES)
+        # 连续多少页没找到"新"公司就停止翻页（避免关键词已采尽时白跑 25 页）
+        self.max_empty_pages = max(int(max_empty_pages or self.MAX_EMPTY_PAGES), 1)
+        # 是否跳过历史指纹库里已采集过的公司（legacy 语义默认跳过；--refresh 时置 False 强制重采）
+        self.skip_seen = bool(skip_seen)
+        # 目标：本次最多入队多少家（None = 不限制）；用于把 CLI 的 --limit 真正落实
+        self.max_count = int(max_count) if max_count else None
+        # 资料页是否改用轻量 HTTP 抓取（默认 True）。
+        # 检索页是 JS 渲染必须用浏览器；但 company-profile / contact-us 是服务端渲染，
+        # 实测 HTTP 抓取 0.5~1.2 秒且字段完整（中文全称 / 注册地址 / 独立站都能拿到），
+        # 而浏览器逐页要约 7 秒且吃内存。这正是 legacy 爬虫原来的做法（浏览器只管列表页）。
+        self.detail_via_http = bool(detail_via_http)
         # 跨页面累积：company_key -> {"expect": n, "handled": n, "emitted": bool, "record": {...}}
         self._companies: dict = {}
         self._seen_names: set = set()
+        self._skipped_seen: int = 0
+        self._enqueued: int = 0
+        # 翻页状态
+        self._pages_fetched: int = 0
+        self._empty_streak: int = 0
+        self._last_page: dict = {"page": 0, "candidates": 0, "skipped": 0}
+        # 待交给 HTTP 阶段抓取的资料页 URL
+        self._http_queue: list[str] = []
+
+    # ------------------------------------------------------------------ #
+    # 执行模式契约：检索页要浏览器，资料页不需要
+    # ------------------------------------------------------------------ #
+    def requires_browser_for(self, url: str) -> bool:
+        # 检索页必须浏览器；资料页走 HTTP，除非显式关掉加速（那样它们由浏览器 crawler 处理）
+        if not self.detail_via_http:
+            return True
+        return self.page_type_of(url) == LABEL_SEARCH
+
+    def pop_http_urls(self) -> list[str]:
+        urls, self._http_queue = self._http_queue, []
+        return urls
 
     # ------------------------------------------------------------------ #
     # ① 提供 URL
@@ -89,10 +139,8 @@ class GlobalSourcesAdapter(BaseAdapter):
         if not self.keyword:
             # 保持原 adapter 的默认行为
             return ["https://www.globalsources.com"]
-        return [
-            self.SEARCH_URL.format(kw=quote_plus(self.keyword), page=page)
-            for page in range(1, self.pages + 1)
-        ]
+        # 只给第 1 页；后续页由 handle -> maybe_enqueue_next_search_page 按需追加
+        return [self.SEARCH_URL.format(kw=quote_plus(self.keyword), page=1)]
 
     # ------------------------------------------------------------------ #
     # ② 页面解析（纯函数：只依赖 AdapterResponse，可离线单测）
@@ -129,9 +177,13 @@ class GlobalSourcesAdapter(BaseAdapter):
             store_url = self.format_clean_url(href).rstrip("/")
             if not store_url:
                 continue
-            if dedup.is_seen(name) or name in self._seen_names:
+            if name in self._seen_names:
                 continue
             self._seen_names.add(name)
+            # 历史指纹库命中：默认跳过（与 legacy 一致），但不静默——计数后在 handle 里如实汇报
+            if self.skip_seen and dedup.is_seen(name):
+                self._skipped_seen += 1
+                continue
 
             profile_url, contact_url = self.resolve_target_urls(store_url)
             candidates.append(
@@ -144,7 +196,7 @@ class GlobalSourcesAdapter(BaseAdapter):
                 }
             )
 
-        if not candidates:
+        if not candidates and not self._skipped_seen:
             logger.info(f"      ℹ️ [GS] 检索页未解析到候选商户: {response.url}")
         return candidates
 
@@ -189,11 +241,26 @@ class GlobalSourcesAdapter(BaseAdapter):
                 self._merge_company(response.meta, record, response)
             return
 
+        # parse_search 会累加 _skipped_seen；这里取本页增量，日志才不会把累计值反复播报
+        skipped_before = self._skipped_seen
         candidates = self.parse(response)
-        await self.enqueue_companies(context, candidates)
-        await self.enqueue_next_search_page(context, response)
+        page_skipped = self._skipped_seen - skipped_before
 
-    async def enqueue_companies(self, context, candidates: list) -> None:
+        self._record_page_stats(response.url, candidates, page_skipped)
+        await self.enqueue_companies(context, candidates, page_skipped)
+        await self.maybe_enqueue_next_search_page(context, response, candidates, page_skipped)
+
+    def _record_page_stats(self, url: str, candidates: list, page_skipped: int) -> None:
+        self._pages_fetched += 1
+        page = self.page_num_of(url) or self._pages_fetched
+        self._last_page = {"page": page, "candidates": len(candidates), "skipped": page_skipped}
+        detail = f"，历史已采 {page_skipped} 家" if page_skipped else ""
+        logger.info(
+            f"      📄 [GS] 第 {page} 页：新候选 {len(candidates)} 家{detail}"
+            f" | 累计入队 {self._enqueued}/{self.max_count or '不限'}"
+        )
+
+    async def enqueue_companies(self, context, candidates: list, page_skipped: int = 0) -> None:
         """把候选商户的资料页/联系页入队（交给 Crawlee 抓取）。
 
         只传纯 URL 字符串：适配器不构造 Request、不导入 crawlee，
@@ -201,7 +268,21 @@ class GlobalSourcesAdapter(BaseAdapter):
         因此不依赖任何传输层元数据（元数据丢失也不会串号）。
         """
         if not candidates:
+            if page_skipped:
+                logger.warning(
+                    f"      ⚠️ [GS] 本页 {page_skipped} 家候选全部命中历史指纹库已跳过（此前已被采集，"
+                    f"累计 {self._skipped_seen} 家）。如需强制重采，请加 --refresh。"
+                )
             return
+
+        if self.max_count:
+            remain = self.max_count - self._enqueued
+            if remain <= 0:
+                logger.info(f"      ⏹️ [GS] 已达本次上限 {self.max_count} 家，停止入队新候选")
+                return
+            candidates = candidates[:remain]
+        self._enqueued += len(candidates)
+
         urls = []
         for cand in candidates:
             key = self.supplier_key_of(cand["store_url"])
@@ -223,6 +304,11 @@ class GlobalSourcesAdapter(BaseAdapter):
 
         if not urls:
             return
+        if self.detail_via_http:
+            # 交给引擎的 HTTP 阶段抓取：浏览器只需处理检索页（这是快慢的关键）
+            self._http_queue.extend(urls)
+            logger.info(f"      🔗 [GS] {len(urls)} 个公司资料页改由 HTTP 抓取（来自 {len(candidates)} 家候选）")
+            return
         try:
             await context.add_requests(urls)
             logger.info(f"      🔗 [GS] 入队 {len(urls)} 个公司资料页（来自 {len(candidates)} 家候选）")
@@ -230,17 +316,50 @@ class GlobalSourcesAdapter(BaseAdapter):
             self.errors.append(f"enqueue_companies: {type(e).__name__}: {e}")
             logger.warning(f"      ⚠️ [GS] 入队公司资料页失败: {e!r}")
 
-    async def enqueue_next_search_page(self, context, response: AdapterResponse) -> None:
-        """按 self.pages 上限入队下一页检索结果。"""
-        if not self.keyword or self.pages <= 1:
+    async def maybe_enqueue_next_search_page(self, context, response: AdapterResponse,
+                                            candidates: list, page_skipped: int = 0) -> None:
+        """按需翻页：本页没有新公司就继续往后翻，直到凑够目标 / 连续空页过多 / 到达页数上限。
+
+        刻意**不做**"一次性把 1..N 页全部入队"：那样会让 N 个重页面同时进入浏览器，
+        实测把内存打满（crawlee 报 105%）并压死 Chrome，同时被站点 429/403 限流。
+        这里是链式翻页——每页处理完才决定是否追加下一页。
+        """
+        if not self.keyword:
             return
         current = self.page_num_of(response.url)
-        if current is None or current >= self.pages:
+        if current is None:
             return
 
-        next_url = self.SEARCH_URL.format(kw=quote_plus(self.keyword), page=current + 1)
+        # ① 目标已达成 → 停（省下后续所有请求）
+        if self.max_count and self._enqueued >= self.max_count:
+            logger.info(f"      ⏹️ [GS] 已凑够目标 {self.max_count} 家，停止翻页（停在第 {current} 页）")
+            return
+
+        # ② 本页是否找到"新"公司（被指纹库跳过的都不算）
+        if candidates:
+            self._empty_streak = 0
+        else:
+            self._empty_streak += 1
+
+        # ③ 连续空页过多 → 关键词基本采尽，停止（避免白跑满页数上限）
+        if self._empty_streak >= self.max_empty_pages:
+            logger.info(
+                f"      ⏹️ [GS] 连续 {self._empty_streak} 页没有新公司，停止翻页（已翻到第 {current} 页）；"
+                f"如需翻得更深可加 --pages，或加 --refresh 重采已采集的公司"
+            )
+            return
+
+        # ④ 到达页数上限
+        if current >= self.pages:
+            logger.info(f"      ⏹️ [GS] 已达翻页上限 {self.pages} 页，停止翻页")
+            return
+
+        next_page = current + 1
+        next_url = self.SEARCH_URL.format(kw=quote_plus(self.keyword), page=next_page)
+        reason = "本页无新公司" if not candidates else f"尚未凑够目标 {self.max_count} 家"
         try:
             await context.add_requests([next_url])
+            logger.info(f"      ➡️ [GS] 继续翻页 -> 第 {next_page} 页（{reason}）")
         except Exception as e:
             logger.debug(f"      [GS] 入队下一页失败: {e!r}")
 
@@ -463,4 +582,13 @@ class GlobalSourcesAdapter(BaseAdapter):
 
     def summary(self) -> str:
         base = super().summary()
-        return f"{base} | 候选池={len(self._companies)}"
+        extra = f" | 候选池={len(self._companies)}"
+        if self._pages_fetched:
+            extra += f" | 已翻{self._pages_fetched}页"
+        if self._enqueued:
+            extra += f" | 已入队={self._enqueued}"
+        if self._skipped_seen:
+            extra += f" | 指纹库跳过={self._skipped_seen}"
+        if not self.skip_seen:
+            extra += " | 已关闭指纹去重(--refresh)"
+        return base + extra

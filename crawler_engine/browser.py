@@ -162,14 +162,25 @@ BLOCK_EXTRA_URL_PATTERNS = ("google-analytics", "doubleclick", "sensorsdata")
 """在 Crawlee 默认拦截（图片/字体/媒体）之外，额外拦截统计与广告脚本。"""
 
 
-def build_pre_navigation_hook(config):
-    """返回页面导航前的处理钩子：反侦测补丁 + 资源拦截。
+def build_pre_navigation_hook(config, limiter=None):
+    """返回页面导航前的处理钩子：请求节奏控制 + 反侦测补丁 + 资源拦截。
 
     归属说明：这些是**浏览器层**职责，必须由引擎负责，Adapter 内不得出现
     （Adapter 只提供 URL、解析页面、返回结构化数据）。
+
+    limiter：`utils.ratelimit.AsyncRateLimiter` 实例，由引擎按 robots.txt 的
+    Crawl-delay 构造。在这里 acquire() 的意义是——**相邻请求间隔成为硬约束**，
+    并且对 429 之后的重试同样生效（重试会重新创建页面并再次走这个钩子），
+    从而避免"被限流 → 立刻重试 → 更狠地被限流"的放大效应。
     """
 
     async def _hook(context) -> None:
+        if limiter is not None:
+            try:
+                await limiter.acquire()
+            except Exception as e:  # 限速器本身故障不应阻断抓取
+                logger.debug(f"[pacing] 限速等待失败(忽略): {e!r}")
+
         page = getattr(context, "page", None)
         if page is None:
             return

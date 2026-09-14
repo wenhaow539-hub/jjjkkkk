@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
+from pathlib import Path
 from typing import Sequence
 
 from utils.logger import get_logger
@@ -37,7 +39,7 @@ logger = get_logger("main")
 
 DEFAULT_PLATFORM = "globalsources"
 DEFAULT_KEYWORD = "phone"
-DEFAULT_LIMIT = 30
+DEFAULT_LIMIT = 10
 DEFAULT_OUTPUT = "suppliers_leads.xlsx"
 
 ADAPTER_REGISTRY = {
@@ -62,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python main.py --pipeline -n 30                  # 委派 pipeline.run_pipeline()\n"
             "  python main.py --discover <url> --save-templates api_templates.json\n"
             "  python main.py --replay api_templates.json --via fetcher\n"
+            "  python main.py --doctor                            # 密钥/依赖/浏览器体检\n"
             "  python main.py --selfcheck\n"
         ),
     )
@@ -71,6 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument("--pipeline", action="store_true",
                         help="委派给未改动的 pipeline.run_pipeline()（原有 Excel 产出链路）")
     target.add_argument("--selfcheck", action="store_true", help="运行自检（职责边界 + 能力接线）")
+    target.add_argument("--doctor", action="store_true",
+                        help="环境体检：密钥有效性与依赖/浏览器/存储可用性（含真实连通性探测）")
     target.add_argument("--discover", default=None, help="发现目标页的接口（xhr/fetch/graphql/json）")
     target.add_argument("--replay", default=None, help="按模板文件批量调用接口")
 
@@ -89,12 +94,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cdp-url", default=None, help="附着到已登录的 Chrome，例如 http://127.0.0.1:9222")
     parser.add_argument("--headless", action="store_true", help="无头模式（默认有头，便于人工过验证码）")
     parser.add_argument("--no-robots", action="store_true", help="关闭 robots.txt 检查（请自行确认合规）")
+    parser.add_argument("--interval", type=float, default=None,
+                        help="相邻请求最小间隔（秒）。默认 3.0，并自动服从 robots.txt 声明的 Crawl-delay")
+    parser.add_argument("--no-crawl-delay", action="store_true",
+                        help="不按 robots.txt 的 Crawl-delay 放慢（默认服从；关闭会显著提高被封风险）")
     parser.add_argument("--proxy", action="append", default=None, help="代理 URL，可重复传入")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
     # --pipeline 专用
     parser.add_argument("--no-enrich", action="store_true", help="--pipeline：跳过独立站探测与天眼查补全")
     parser.add_argument("--no-resume", action="store_true", help="--pipeline：不使用断点续采")
+    parser.add_argument("--refresh", action="store_true",
+                        help="忽略历史指纹库，强制重采已采集过的公司（默认会跳过并给出提示）")
+    parser.add_argument("--all-browser", action="store_true",
+                        help="不用两阶段加速：连资料页也走浏览器（默认资料页改走 HTTP，快约 5 倍）")
+    parser.add_argument("--pages", type=int, default=None,
+                        help="翻页上限（默认 25）。按需翻页：本页没有新公司才继续往后翻，"
+                             "凑够 -n 目标家数即停")
+    parser.add_argument("--max-empty-pages", type=int, default=None,
+                        help="连续多少页没有新公司就停止翻页（默认 5），避免关键词采尽后白跑")
 
     # 转发给引擎 CLI 的发现/重放参数
     parser.add_argument("--save-templates", default=None, help="发现完成后保存模板的路径")
@@ -117,6 +135,8 @@ def _engine_config(args, *, mode: str | None = None):
         proxy_urls=tuple(args.proxy) if args.proxy else None,
         queue_name=args.queue,
         log_level=args.log_level,
+        min_request_interval=args.interval,
+        respect_crawl_delay=False if args.no_crawl_delay else None,
     )
 
 
@@ -136,8 +156,16 @@ async def run_adapter(args) -> int:
             return 2
 
     config = _engine_config(args)
-    adapter = load_adapter(adapter_path, keyword=args.keyword)
-    logger.info(f"🚀 [main] Adapter + Crawlee | {adapter_path} | keyword={args.keyword} | 上限={args.limit}")
+    adapter = load_adapter(adapter_path, keyword=args.keyword, skip_seen=not args.refresh,
+                           max_count=args.limit, pages=args.pages,
+                           max_empty_pages=args.max_empty_pages,
+                           detail_via_http=not args.all_browser)
+    logger.info(
+        f"🚀 [main] Adapter + Crawlee | {adapter_path} | keyword={args.keyword} | "
+        f"上限={args.limit} | 指纹去重={'关(--refresh)' if args.refresh else '开'} | "
+        f"翻页=按需（最多 {args.pages or '25'} 页，连续 {args.max_empty_pages or 5} 页无新公司即停） | "
+        f"资料页={'走浏览器(--all-browser)' if args.all_browser else '走 HTTP 加速'}"
+    )
 
     runner = CrawlRunner(config)
     result = await runner.run(adapter)
@@ -145,6 +173,14 @@ async def run_adapter(args) -> int:
     print()
     print(f"Adapter : {adapter_path}")
     print(f"结果    : {result.summary()}")
+    if hasattr(adapter, "_skipped_seen") and adapter._skipped_seen and result.items == 0:
+        print(f"提示    : 本次解析到的公司都已在历史指纹库中（共 {adapter._skipped_seen} 家），"
+              f"因此没有新增采集。要强制重采请加 --refresh，或换一个 --keyword。")
+    if hasattr(adapter, "_empty_streak") and adapter._empty_streak >= getattr(adapter, "max_empty_pages", 5):
+        print(f"提示    : 连续 {adapter._empty_streak} 页没有新公司，已停止翻页 —— 该关键词基本采尽，"
+              f"建议换关键词（或加 --refresh 重采）。")
+    if result.status == "partial":
+        print("提示    : 爬取中途异常终止，但已采集的记录仍然有效（详见上方 ❌ 错误行）。")
 
     if args.excel:
         from models import RawSupplierLead
@@ -229,6 +265,10 @@ def forward_to_engine(args) -> int:
         argv.append("--headless")
     if args.no_robots:
         argv.append("--no-robots")
+    if args.interval is not None:
+        argv += ["--interval", str(args.interval)]
+    if args.no_crawl_delay:
+        argv.append("--no-crawl-delay")
     if args.concurrency:
         argv += ["--concurrency", str(args.concurrency)]
     if args.queue:
@@ -245,8 +285,99 @@ def forward_to_engine(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# 体检：密钥有效性 + 依赖 / 浏览器 / 存储可用性
+# --------------------------------------------------------------------------- #
+def run_doctor(args) -> int:
+    """环境体检。重点是把"静默降级"变成显式可见（例如密钥失效导致 LLM 质检全员跳过）。"""
+    import httpx
+
+    import config as app_config
+    from crawler_engine.architecture import run_checks
+    from crawler_engine.capabilities import audit as audit_capabilities
+
+    failures: list[str] = []
+    print()
+    print("环境体检")
+
+    # 1) 密钥
+    env_file = Path(__file__).resolve().parent / ".env"
+    print(f"    .env 文件      : {'存在' if env_file.exists() else '不存在（可复制 .env.example）'}")
+    print(f"    密钥配置       : {app_config.api_key_status()}")
+    if app_config.OPENAI_API_KEY:
+        try:
+            resp = httpx.get(
+                f"{app_config.OPENAI_BASE_URL}/models",
+                headers={"Authorization": f"Bearer {app_config.OPENAI_API_KEY}"},
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                models = [m.get("id") for m in resp.json().get("data", [])][:3]
+                print(f"    密钥连通性     : ✅ 200（可用模型示例 {models}）")
+            elif resp.status_code in (401, 403):
+                print(f"    密钥连通性     : ❌ {resp.status_code} 密钥无效/已被吊销 → 大模型质检会全员降级")
+                failures.append("大模型密钥无效，请到 DeepSeek 控制台重新签发并写入 .env")
+            else:
+                print(f"    密钥连通性     : ⚠️ HTTP {resp.status_code} {resp.text[:60]}")
+        except Exception as e:
+            print(f"    密钥连通性     : ⚠️ 无法连通（{type(e).__name__}）")
+    else:
+        print("    密钥连通性     : ⚠️ 未配置密钥，大模型质检走内置降级（采集与导出不受影响）")
+
+    # 2) 依赖
+    try:
+        import importlib.metadata as md
+        import crawlee
+
+        versions = {p: md.version(p) for p in ("crawlee", "playwright", "httpx", "parsel")}
+        print(f"    引擎依赖       : ✅ " + " / ".join(f"{k}={v}" for k, v in versions.items()))
+    except Exception as e:
+        print(f"    引擎依赖       : ❌ {type(e).__name__}: {e}")
+        failures.append("引擎依赖缺失（crawlee/playwright 等）")
+
+    # 3) 浏览器
+    ms_playwright = Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright"
+    chromium_ok = ms_playwright.exists() and any(ms_playwright.glob("chromium-*"))
+    chrome_paths = [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+    chrome_ok = any(Path(p).exists() for p in chrome_paths)
+    print(f"    Playwright 内置: {'✅ 已安装' if chromium_ok else '⚠️ 未安装（python -m playwright install chromium）'}")
+    print(f"    本机 Chrome    : {'✅ 已安装' if chrome_ok else '⚠️ 未找到（托管模式将退回内置浏览器）'}")
+
+    # 4) CDP 连通性（仅当配置了 cdp_url）
+    if args.cdp_url:
+        from crawler_engine import cdp_is_reachable
+
+        ok = cdp_is_reachable(args.cdp_url)
+        print(f"    CDP {args.cdp_url:<22}: {'✅ 可达' if ok else '❌ 不可达（Chrome 未以调试端口启动？）'}")
+        if not ok:
+            failures.append(f"CDP 不可达：{args.cdp_url}")
+    else:
+        print("    CDP            : 未配置（加 --cdp-url http://127.0.0.1:9222 可附着已登录 Chrome）")
+
+    # 5) 引擎自检
+    errors, notes = run_checks()
+    wired = sum(1 for c in audit_capabilities() if c.wired)
+    print(f"    职责边界       : {'✅ 无越界' if not errors else f'❌ {len(errors)} 项越界'}（已登记例外 {len(notes)}）")
+    print(f"    能力接线       : {wired}/9")
+    if errors:
+        failures.append("引擎职责边界越界（运行 python -m crawler_engine --selfcheck 查看）")
+
+    print()
+    if failures:
+        print(f"体检未通过：{len(failures)} 项")
+        for item in failures:
+            print(f"  ❌ {item}")
+        return 1
+    print("体检通过")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.doctor:
+        return run_doctor(args)
 
     if any((args.selfcheck, args.discover, args.replay)):
         return forward_to_engine(args)

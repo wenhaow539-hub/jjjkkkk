@@ -351,6 +351,13 @@ class ApiTemplateRunner:
                 stats[template.name].note = "GraphQL persisted query：重放需提供相同 hash 与 variables（部分支持）"
 
         started = time.perf_counter()
+        # 重放同样服从 robots.txt 声明的 Crawl-delay（两条通路都走这里的 config）
+        if rendered:
+            from crawler_engine.runner import CrawlerRunner
+
+            self.config = await CrawlerRunner(self.config).resolve_pacing(
+                self.config, [rendered[0].url]
+            )
         if via == "crawlee":
             results = await self._replay_via_crawlee(rendered)
         elif via == "fetcher":

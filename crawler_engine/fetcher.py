@@ -83,7 +83,7 @@ class AsyncFetcher:
         self.session = session or HttpSessionState(user_agent=UARotator().next())
         self._ua_rotator = UARotator()
         self.rate_limiter = rate_limiter or AsyncRateLimiter(
-            min_interval=self.config.min_request_interval, jitter=self.config.jitter
+            min_interval=self.config.effective_interval(), jitter=self.config.jitter
         )
         self.robots = robots_checker or RobotsChecker()
         self.stats = {"requests": 0, "blocked": 0, "retries": 0, "errors": 0}
