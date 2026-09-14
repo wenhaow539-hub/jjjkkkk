@@ -2,13 +2,17 @@ import asyncio
 import random
 import re
 from urllib.parse import quote_plus, urljoin
+from utils.logger import get_logger
 from utils.phone import deduplicate_phone_list
+
+logger = get_logger("tianyancha")
+
 
 class TianyanchaEnricher:
     async def _human_rest(self, min_sec: float = 3.0, max_sec: float = 5.0, desc: str = ""):
         rest_time = round(random.uniform(min_sec, max_sec), 2)
         if desc:
-            print(f"      ⏱️ [天眼查安全冷却] {desc}，等待 {rest_time} 秒...")
+            logger.info(f"      ⏱️ [天眼查安全冷却] {desc}，等待 {rest_time} 秒...")
         await asyncio.sleep(rest_time)
 
     async def _handle_captcha_if_needed(self, page):
@@ -23,22 +27,22 @@ class TianyanchaEnricher:
             is_blocked = True
 
         if is_blocked:
-            print("\n" + "!" * 60)
-            print("🚨 [天眼查风控触发] 检测到滑块验证码 / 安全防护拦截！")
-            print("👉 请切回已打开的 Chrome 浏览器窗口，【手动滑动完成验证】。")
-            print("⏳ 流水线已自动暂停等待，验证通过后会自动恢复运行...")
-            print("!" * 60 + "\n")
+            logger.warning("\n" + "!" * 60)
+            logger.warning("🚨 [天眼查风控触发] 检测到滑块验证码 / 安全防护拦截！")
+            logger.warning("👉 请切回已打开的 Chrome 浏览器窗口，【手动滑动完成验证】。")
+            logger.warning("⏳ 流水线已自动暂停等待，验证通过后会自动恢复运行...")
+            logger.warning("!" * 60 + "\n")
 
             for _ in range(120):
                 await asyncio.sleep(2)
                 cur_url = page.url.lower()
                 captcha_now = await page.query_selector('.sec-captcha, .geetest_holder, div[class*="captcha"]')
                 if "sec.tianyancha.com" not in cur_url and not captcha_now:
-                    print("✅ [人工验证成功] 恢复自动化抓取！\n")
+                    logger.info("✅ [人工验证成功] 恢复自动化抓取！\n")
                     await self._human_rest(2.0, 3.5, desc="缓和停顿")
                     return
 
-            print("⚠️ 人工验证等待超时，跳过该商户天眼查查询。")
+            logger.warning("⚠️ 人工验证等待超时，跳过该商户天眼查查询。")
 
     async def search_and_enrich(self, page, company_name: str) -> dict:
         info = {
@@ -53,7 +57,7 @@ class TianyanchaEnricher:
             return info
 
         search_kw = company_name.strip()
-        print(f"      🔎 [天眼查检索] 正在检索: {search_kw}")
+        logger.info(f"      🔎 [天眼查检索] 正在检索: {search_kw}")
 
         try:
             await page.goto(
@@ -67,7 +71,7 @@ class TianyanchaEnricher:
 
             card_el = await page.query_selector('div[class*="search-item"], .search-block, div[class*="result-item"]')
             if not card_el:
-                print(f"      ℹ️ [天眼查] 未找到匹配的企业卡片: {search_kw}")
+                logger.info(f"      ℹ️ [天眼查] 未找到匹配的企业卡片: {search_kw}")
                 return info
 
             card_text = (await card_el.inner_text()).strip()
@@ -126,10 +130,10 @@ class TianyanchaEnricher:
             if deduped:
                 info["phone"] = " / ".join(deduped[:2])
 
-            print(f"      ✅ [天眼查成功] 中文名: {info['registered_company'] or '未查到'} | 地址: {info['registered_address'] or '未公开'} | 电话: {info['phone'] or '未公开'}")
+            logger.info(f"      ✅ [天眼查成功] 中文名: {info['registered_company'] or '未查到'} | 地址: {info['registered_address'] or '未公开'} | 电话: {info['phone'] or '未公开'}")
 
         except Exception as e:
-            print(f"      ⚠️ [天眼查检索异常] {search_kw}: {e}")
+            logger.warning(f"      ⚠️ [天眼查检索异常] {search_kw}: {e}")
 
         await self._human_rest(2.5, 4.0, desc="检索冷却")
         return info

@@ -3,6 +3,9 @@ import json
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 from models import RawSupplierLead
+from utils.logger import get_logger
+
+logger = get_logger("evaluator")
 
 class EvaluatedSupplier(BaseModel):
     clean_company_name: str = ""
@@ -64,5 +67,5 @@ async def evaluate_supplier_icp(
         data = json.loads(response.choices[0].message.content)
         return EvaluatedSupplier(**data)
     except Exception as e:
-        print(f"      ⚠️ [LLM 质检跳过] {lead.company} 请求异常: {e}")
+        logger.warning(f"      ⚠️ [LLM 质检跳过] {lead.company} 请求异常: {e}")
         return default_result

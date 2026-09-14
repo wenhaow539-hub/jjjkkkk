@@ -2,7 +2,10 @@ import asyncio
 import re
 from urllib.parse import urljoin, urlparse
 import httpx
+from utils.logger import get_logger
 from utils.phone import deduplicate_phone_list
+
+logger = get_logger("website")
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', re.IGNORECASE)
 IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.css', '.js', '.ico')
@@ -104,7 +107,7 @@ class WebsiteEnricher:
             status_code, home_html, final_err = await self._fetch_html_resilient(client, website)
             if status_code != 200 or not home_html:
                 result["icp"] = "网址打不开"
-                print(f"      ❌ [独立站打不开] {website} (原因: {final_err})")
+                logger.warning(f"      ❌ [独立站打不开] {website} (原因: {final_err})")
                 return result
 
             icp_match = ICP_REGEX.search(home_html)
@@ -144,14 +147,14 @@ class WebsiteEnricher:
                     if any(free in e for free in ["@gmail.com", "@yahoo.com", "@hotmail.com"]): score -= 10
                     return score
                 result["email"] = sorted(list(set(raw_emails)), key=score_email, reverse=True)[0]
-                print(f"      📧 [官网邮箱] 提取成功: {result['email']} ({website})")
+                logger.info(f"      📧 [官网邮箱] 提取成功: {result['email']} ({website})")
 
             clean_phones = deduplicate_phone_list(raw_phones)
             if clean_phones:
                 result["site_phone"] = " / ".join(clean_phones[:3])
-                print(f"      📞 [官网联系方式] 提取成功: {result['site_phone']} ({website})")
+                logger.info(f"      📞 [官网联系方式] 提取成功: {result['site_phone']} ({website})")
 
             if result["icp"] != "无":
-                print(f"      🛡️ [备案信息] 提取到备案号: {result['icp']} ({website})")
+                logger.info(f"      🛡️ [备案信息] 提取到备案号: {result['icp']} ({website})")
 
         return result

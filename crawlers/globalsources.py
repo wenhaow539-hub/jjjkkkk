@@ -2,6 +2,7 @@ import asyncio
 import random
 import re
 from urllib.parse import quote_plus, urljoin
+
 import httpx
 from playwright.async_api import async_playwright
 
@@ -9,11 +10,24 @@ from core.base_crawler import BaseCrawler
 from core.factory import CrawlerFactory
 from models import RawSupplierLead
 from utils.dedup import dedup
+from utils.logger import get_logger
+from utils.parsing import find_labeled_value, soup_from_html
+from utils.ratelimit import AsyncRateLimiter
+from utils.robots import RobotsChecker
+
+logger = get_logger("globalsources")
+
 
 @CrawlerFactory.register("globalsources")
 class GlobalSources(BaseCrawler):
     platform_name = "Global Sources"
     platform_id = "globalsources"
+
+    def __init__(self, cdp_port: int = 9222, concurrency: int = 4):
+        super().__init__(cdp_port=cdp_port, concurrency=concurrency)
+        # 全局请求限速：所有详情页请求共享节奏，避免请求风暴（P1 反爬项）
+        self._rate_limiter = AsyncRateLimiter(min_interval=1.2, jitter=0.35)
+        self._robots = RobotsChecker()
 
     def _format_clean_url(self, href: str) -> str:
         if not href:
@@ -27,7 +41,7 @@ class GlobalSources(BaseCrawler):
             return f"https://www.globalsources.com/{href}"
         return href
 
-    def _resolve_target_urls(self, store_url: str) -> tuple[str, str]:
+    def _resolve_target_urls(self, store_url: str) -> tuple:
         if re.search(r'/(?:homepage|contact-us|company-profile|showroom)_(\d+)\.htm', store_url, re.I):
             profile_url = re.sub(r'/(?:homepage|contact-us|company-profile|showroom)_', '/company-profile_', store_url, flags=re.I)
             contact_url = re.sub(r'/(?:homepage|contact-us|company-profile|showroom)_', '/contact-us_', store_url, flags=re.I)
@@ -42,23 +56,42 @@ class GlobalSources(BaseCrawler):
         clean_base = store_url.rstrip('/')
         return f"{clean_base}/company-profile.htm", f"{clean_base}/contact-us.htm"
 
-    async def _fetch_html(self, client: httpx.AsyncClient, url: str, retries: int = 2) -> str:
+    async def _fetch_html(self, client: httpx.AsyncClient, url: str, retries: int = 3) -> str:
+        """带 robots 合规检查、全局限速与指数退避的 HTML 抓取（失败必有日志，不再静默）。"""
         if not url:
             return ""
+        if not await self._robots.can_fetch(client, url):
+            logger.warning(f"🤖 [robots] {url} 被 robots.txt 禁止抓取，已跳过。")
+            return ""
         for attempt in range(retries + 1):
+            await self._rate_limiter.acquire()
             try:
                 resp = await client.get(url, timeout=15.0)
                 if resp.status_code == 200:
                     return resp.text
-                elif resp.status_code in [429, 503]:
-                    await asyncio.sleep(1.0 * (attempt + 1))
-            except Exception:
-                if attempt == retries:
+                if resp.status_code in (429, 503):
+                    retry_after = resp.headers.get("retry-after", "")
+                    try:
+                        base_delay = float(retry_after) if retry_after else 0.0
+                    except ValueError:
+                        base_delay = 0.0
+                    # 指数退避(2/4/8s) + 随机抖动，尊重服务端 Retry-After（P1：原为 1-2s 线性硬重试）
+                    delay = max(base_delay, 2.0 * (2 ** attempt)) * random.uniform(0.8, 1.3)
+                    logger.warning(f"⏳ [{resp.status_code}] {url} 被限流，指数退避 {delay:.1f}s (第 {attempt + 1} 次重试)")
+                    await asyncio.sleep(delay)
+                    continue
+                if 400 <= resp.status_code < 500:
+                    logger.debug(f"[HTTP {resp.status_code}] {url}")
                     return ""
-                await asyncio.sleep(0.8)
+                logger.warning(f"[HTTP {resp.status_code}] {url} (第 {attempt + 1} 次尝试)")
+            except Exception as e:
+                logger.warning(f"⚠️ 请求异常 {url}: {e.__class__.__name__}: {e} (第 {attempt + 1} 次尝试)")
+            if attempt < retries:
+                await asyncio.sleep(0.8 * (attempt + 1))
+        logger.error(f"❌ 抓取失败(重试耗尽): {url}")
         return ""
 
-    def _extract_field_from_text(self, text: str, label_patterns: list[str], stop_words: list[str]) -> str:
+    def _extract_field_from_text(self, text: str, label_patterns: list, stop_words: list) -> str:
         if not text:
             return ""
         lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -117,6 +150,13 @@ class GlobalSources(BaseCrawler):
             info["registered_company"] = self._extract_field_from_text(contact_text, comp_labels, stop_words)
         if not info["registered_company"] and home_text:
             info["registered_company"] = self._extract_field_from_text(home_text, comp_labels, stop_words)
+        # DOM 结构化兜底（BeautifulSoup）：页面改版导致行式匹配失效时的第二道防线
+        if not info["registered_company"]:
+            for soup in (soup_from_html(profile_html), soup_from_html(contact_html)):
+                value = find_labeled_value(soup, comp_labels, stop_words)
+                if value:
+                    info["registered_company"] = self.clean_token(value)
+                    break
 
         addr_labels = [
             r'Company\s*Registration\s*Address', r'Registered\s*Address', r'Registration\s*Address',
@@ -129,6 +169,12 @@ class GlobalSources(BaseCrawler):
             info["registered_address"] = self._extract_field_from_text(contact_text, addr_labels, addr_stops)
         if not info["registered_address"] and home_text:
             info["registered_address"] = self._extract_field_from_text(home_text, addr_labels, addr_stops)
+        if not info["registered_address"]:
+            for soup in (soup_from_html(profile_html), soup_from_html(contact_html)):
+                value = find_labeled_value(soup, addr_labels, addr_stops)
+                if value:
+                    info["registered_address"] = self.clean_token(value)
+                    break
 
         for candidate_text in [contact_text, profile_text, home_text]:
             if info["official_website"]: break
@@ -147,15 +193,22 @@ class GlobalSources(BaseCrawler):
 
         return info
 
-    async def scrape(self, keyword: str, max_count: int) -> list[RawSupplierLead]:
+    async def scrape(self, keyword: str, max_count: int) -> list:
         self.ensure_chrome_running()
         clean_kw = keyword.lower().replace("manufacturer", "").strip()
+
+        # robots.txt 合规预检：检索页被禁则直接终止，不做任何抓取（P1 合规项）
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as rc:
+            search_probe = f"https://www.globalsources.com/searchList/suppliers?keyWord={quote_plus(clean_kw)}&pageNum=1"
+            if not await self._robots.can_fetch(rc, search_probe):
+                logger.error("🚫 [robots.txt] Global Sources 检索页被 robots.txt 禁止抓取，本次运行已终止。")
+                raise RuntimeError("robots.txt 禁止抓取目标检索页，请检查 https://www.globalsources.com/robots.txt")
 
         candidate_sellers = []
         seen_companies = set()
 
         async with async_playwright() as p:
-            print(f"🔌 [{self.platform_name}] 接入 Chrome (CDP 端口: {self.cdp_port})...")
+            logger.info(f"🔌 [{self.platform_name}] 接入 Chrome (CDP 端口: {self.cdp_port})...")
             browser = await p.chromium.connect_over_cdp(f"http://127.0.0.1:{self.cdp_port}")
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             page = context.pages[0] if context.pages else await context.new_page()
@@ -168,13 +221,13 @@ class GlobalSources(BaseCrawler):
 
             while len(candidate_sellers) < max_count and page_num <= max_search_pages:
                 search_url = f"https://www.globalsources.com/searchList/suppliers?keyWord={quote_plus(clean_kw)}&pageNum={page_num}"
-                print(f"📑 [{self.platform_name}] 检索第 {page_num} 页: {search_url}")
+                logger.info(f"📑 [{self.platform_name}] 检索第 {page_num} 页: {search_url}")
 
                 try:
                     await page.goto(search_url, wait_until="domcontentloaded", timeout=35000)
                     await self.human_delay(2.0, 3.0, desc=f"第 {page_num} 页就绪")
                 except Exception as e:
-                    print(f"⚠️ 第 {page_num} 页加载超时: {e}")
+                    logger.warning(f"⚠️ 第 {page_num} 页加载超时: {e}")
                     break
 
                 for _ in range(3):
@@ -207,7 +260,7 @@ class GlobalSources(BaseCrawler):
                         candidate_sellers.append({"company": comp_name, "store_url": clean_url})
                         page_added += 1
 
-                print(f"✅ [{self.platform_name}] 候选入库: +{page_added} 家 (当前累计: {len(candidate_sellers)}/{max_count})")
+                logger.info(f"✅ [{self.platform_name}] 候选入库: +{page_added} 家 (当前累计: {len(candidate_sellers)}/{max_count})")
                 if len(candidate_sellers) < max_count:
                     page_num += 1
                     await self.human_delay(1.5, 2.5, desc="翻页冷却")
@@ -224,7 +277,7 @@ class GlobalSources(BaseCrawler):
         if not candidate_sellers:
             return []
 
-        print(f"🚀 [{self.platform_name}] 启动 HTTPX 异步提取 {len(candidate_sellers)} 家商户工商与独立站...")
+        logger.info(f"🚀 [{self.platform_name}] 启动 HTTPX 异步提取 {len(candidate_sellers)} 家商户工商与独立站...")
         semaphore = asyncio.Semaphore(self.concurrency)
         custom_headers = {
             "User-Agent": user_agent,
@@ -234,21 +287,43 @@ class GlobalSources(BaseCrawler):
 
         async with httpx.AsyncClient(cookies=session_cookies, headers=custom_headers, follow_redirects=True, timeout=15.0) as client:
             async def process_item(idx: int, s: dict):
+                # 异常隔离：单商户失败仅返回 None，不再让 gather 炸掉整批（P1 稳定性项）
                 async with semaphore:
-                    detail = await self._parse_detail(client, s["store_url"])
-                    dedup.add(s["company"])
-                    if detail.get("registered_company"):
-                        dedup.add(detail["registered_company"])
+                    try:
+                        detail = await self._parse_detail(client, s["store_url"])
+                        dedup.add(s["company"])
+                        if detail.get("registered_company"):
+                            dedup.add(detail["registered_company"])
 
-                    return RawSupplierLead(
-                        company=s["company"],
-                        platform=self.platform_name,
-                        store_url=s["store_url"],
-                        registered_company=detail.get("registered_company", ""),
-                        registered_address=detail.get("registered_address", ""),
-                        official_website=detail.get("official_website", ""),
-                        card_product=clean_kw
-                    )
+                        return RawSupplierLead(
+                            company=s["company"],
+                            platform=self.platform_name,
+                            store_url=s["store_url"],
+                            registered_company=detail.get("registered_company", ""),
+                            registered_address=detail.get("registered_address", ""),
+                            official_website=detail.get("official_website", ""),
+                            card_product=clean_kw
+                        )
+                    except Exception as e:
+                        logger.error(f"❌ [详情提取失败] {s.get('company')}: {e!r}")
+                        return None
 
             tasks = [process_item(i, seller) for i, seller in enumerate(candidate_sellers, 1)]
-            return await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks)
+
+        leads = [r for r in results if r is not None]
+        logger.info(f"✅ [{self.platform_name}] 详情提取完成: {len(leads)}/{len(candidate_sellers)} 家成功")
+
+        # 解析质量观测：字段缺失率是页面改版的第一告警信号（原为静默空值，无法察觉失效）
+        if leads:
+            miss_name = sum(1 for l in leads if not l.registered_company)
+            miss_addr = sum(1 for l in leads if not l.registered_address)
+            miss_site = sum(1 for l in leads if not l.official_website)
+            logger.info(
+                f"📊 [解析质量] 公司名缺失 {miss_name}/{len(leads)} | "
+                f"地址缺失 {miss_addr}/{len(leads)} | 独立站缺失 {miss_site}/{len(leads)}"
+            )
+            if miss_name / len(leads) > 0.5:
+                logger.warning("⚠️ 超过一半商户的公司名解析失败，页面结构可能已改版，请检查标签规则与选择器！")
+
+        return leads

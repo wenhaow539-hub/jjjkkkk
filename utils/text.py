@@ -2,6 +2,11 @@ import html as html_lib
 import re
 
 def is_valid_company_name(name: str) -> bool:
+    """公司名白名单校验：必须含公司后缀词，且不命中产品/平台垃圾词。
+
+    （P1 修复）原逻辑对无后缀名称走"不含产品词即通过"的黑名单兜底，
+    会放行 "Verified Supplier" / "Hot Products" 等垃圾锚文本；现改为必须命中公司后缀。
+    """
     if not name or not isinstance(name, str):
         return False
     clean_name = re.sub(r'^[,\.;:\s"\'\(]+|[,\.;:\s"\'\)]+$', '', name.strip())
@@ -26,11 +31,16 @@ def is_valid_company_name(name: str) -> bool:
         r'\btechnology\b|\btechnologies\b|'
         r'\benterprise\b|\bindustrial\b)'
     )
-    if bool(re.search(company_pattern, name_lower)):
-        return True
+    if not re.search(company_pattern, name_lower):
+        return False
 
-    pure_products = ["gaming monitor", "wholesale", "factory price", "moq", "pieces", "frameless", "hot sale"]
-    return not any(pk in name_lower for pk in pure_products)
+    junk_phrases = [
+        "gaming monitor", "wholesale", "factory price", "moq", "pieces",
+        "frameless", "hot sale", "hot products", "verified supplier",
+        "gold member", "gold supplier", "trade assurance", "send inquiry",
+        "inquiry now", "chat now", "contact supplier", "request quote", "view more",
+    ]
+    return not any(pk in name_lower for pk in junk_phrases)
 
 def clean_token(val: str) -> str:
     if not val:

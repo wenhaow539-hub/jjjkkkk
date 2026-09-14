@@ -7,3 +7,15 @@ openpyxl>=3.1.0
 pandas>=2.0.0
 beautifulsoup4>=4.12.0
 python-dotenv>=1.0.0
+
+# —— Crawlee 统一执行底座（crawler_engine/）——
+crawlee>=1.10.0
+# playwright extra：确保 crawlee 的浏览器抓取能力依赖齐全
+crawlee[playwright]>=1.10.0
+# crawlee.crawlers 命名空间依赖（ParselCrawler 的 CSS/XPath 解析）
+parsel>=1.9.0
+
+# 安装后需执行一次浏览器安装（已验证可用）：
+#   python -m playwright install
+# CDP 附着模式复用本机 Chrome，无需下载浏览器；
+# 托管模式（browser / 无头）需要上面的 playwright install。

@@ -3,6 +3,10 @@ import os
 from openpyxl.styles import Alignment, PatternFill
 import pandas as pd
 
+from utils.logger import get_logger
+
+logger = get_logger("export")
+
 TARGET_COLUMNS = [
     "平台名称", "公司英文名", "平台网址", "公司中文名", "公司注册地址",
     "天眼查联系人", "天眼查联系人职位", "独立站", "网址是否有备案",
@@ -16,7 +20,7 @@ def export_leads_to_excel(
     keyword: str,
     output_file: str = "suppliers_leads.xlsx"
 ) -> str:
-    print(f"\n📊 [数据整理与导出] 正在写入 Excel 报表...")
+    logger.info(f"\n📊 [数据整理与导出] 正在写入 Excel 报表...")
     new_rows = []
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -62,7 +66,21 @@ def export_leads_to_excel(
             merged_df = pd.concat([old_df[TARGET_COLUMNS], new_df], ignore_index=True)
             merged_df.drop_duplicates(subset=["平台网址"], keep="last", inplace=True)
             final_df = merged_df[TARGET_COLUMNS]
-        except Exception:
+        except Exception as e:
+            # 数据保护（P1 修复）：原逻辑此处静默丢弃全部历史数据，
+            # 现改为先把损坏文件备份移走，历史数据永远不删，事后可人工抢救合并。
+            backup_path = f"{output_file}.{int(datetime.now().timestamp())}.bak"
+            try:
+                os.replace(output_file, backup_path)
+                logger.error(
+                    f"⚠️ [数据保护] 读取历史报表失败({e!r})，原文件已备份至 {backup_path}，"
+                    f"本次仅写入新数据（历史数据完整保留在备份中，请人工检查后合并）。"
+                )
+            except OSError:
+                logger.error(
+                    f"⚠️ [数据保护] 读取历史报表失败({e!r})，且备份原文件失败！"
+                    f"请立即人工检查 {output_file}，避免历史数据丢失。"
+                )
             final_df = new_df
     else:
         final_df = new_df
@@ -74,7 +92,7 @@ def export_leads_to_excel(
                 pass
     except PermissionError:
         target_path = f"suppliers_leads_{int(datetime.now().timestamp())}.xlsx"
-        print(f"⚠️ [占用警告] 原文件被占用，已重定向写入至: {target_path}")
+        logger.warning(f"⚠️ [占用警告] 原文件被占用，已重定向写入至: {target_path}")
 
     with pd.ExcelWriter(target_path, engine="openpyxl") as writer:
         final_df.to_excel(writer, index=False, sheet_name="Suppliers")
@@ -98,6 +116,6 @@ def export_leads_to_excel(
                     if cell.value is not None:
                         cell.value = str(cell.value)
 
-    print(f"\n🎉 [流水线完成] 数据已入库: {target_path}")
-    print(f"📈 累计总商户: {len(final_df)} 条 (本次追加: {len(new_df)} 条)")
+    logger.info(f"\n🎉 [流水线完成] 数据已入库: {target_path}")
+    logger.info(f"📈 累计总商户: {len(final_df)} 条 (本次追加: {len(new_df)} 条)")
     return target_path
