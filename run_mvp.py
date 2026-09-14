@@ -1,11 +1,9 @@
 import asyncio
 from pipeline import run_pipeline
 
-# 核心采集运行配置
-# 支持动态切换已注册的爬虫标识: "globalsources", "alibaba", "made-in-china"
 TARGET_PLATFORM = "globalsources"
 SEARCH_KEYWORD = "phone"
-SCRAPE_LIMIT = 10
+SCRAPE_LIMIT = 5
 OUTPUT_FILE = "suppliers_leads.xlsx"
 
 if __name__ == "__main__":

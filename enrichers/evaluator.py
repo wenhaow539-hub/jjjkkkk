@@ -1,9 +1,8 @@
-import asyncio
+
 import json
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 from models import RawSupplierLead
-
 
 class EvaluatedSupplier(BaseModel):
     clean_company_name: str = ""
@@ -11,16 +10,12 @@ class EvaluatedSupplier(BaseModel):
     confidence_score: float = 1.0
     summary: str = ""
 
-
 async def evaluate_supplier_icp(
     lead: RawSupplierLead,
     api_key: str,
     base_url: str = "https://api.deepseek.com",
     model: str = "deepseek-chat"
 ) -> EvaluatedSupplier:
-    """
-    大模型质检：规范已有中文名，严禁根据共享办公地址臆测公司名
-    """
     fallback_name = lead.registered_company or ""
     default_result = EvaluatedSupplier(
         clean_company_name=fallback_name,
@@ -55,7 +50,6 @@ async def evaluate_supplier_icp(
   "summary": "判定依据"
 }}
 """
-
     try:
         client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=12.0)
         response = await client.chat.completions.create(
@@ -67,8 +61,7 @@ async def evaluate_supplier_icp(
             response_format={"type": "json_object"},
             temperature=0.0
         )
-        content = response.choices[0].message.content
-        data = json.loads(content)
+        data = json.loads(response.choices[0].message.content)
         return EvaluatedSupplier(**data)
     except Exception as e:
         print(f"      ⚠️ [LLM 质检跳过] {lead.company} 请求异常: {e}")

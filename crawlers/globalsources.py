@@ -5,10 +5,10 @@ from urllib.parse import quote_plus, urljoin
 import httpx
 from playwright.async_api import async_playwright
 
-from adapters import BaseCrawler, CrawlerFactory
-from dedup import dedup
+from core.base_crawler import BaseCrawler
+from core.factory import CrawlerFactory
 from models import RawSupplierLead
-
+from utils.dedup import dedup
 
 @CrawlerFactory.register("globalsources")
 class GlobalSources(BaseCrawler):
@@ -28,21 +28,17 @@ class GlobalSources(BaseCrawler):
         return href
 
     def _resolve_target_urls(self, store_url: str) -> tuple[str, str]:
-        """全面兼容带 ID 下划线、/si/ 路由与二级域名根目录的 .htm 路径"""
-        # 1. 匹配标准带数字 ID 下划线: /homepage_60088.htm
         if re.search(r'/(?:homepage|contact-us|company-profile|showroom)_(\d+)\.htm', store_url, re.I):
             profile_url = re.sub(r'/(?:homepage|contact-us|company-profile|showroom)_', '/company-profile_', store_url, flags=re.I)
             contact_url = re.sub(r'/(?:homepage|contact-us|company-profile|showroom)_', '/contact-us_', store_url, flags=re.I)
             return profile_url, contact_url
 
-        # 2. 匹配 /si/ 格式
         si_match = re.search(r'/si/(\d+)', store_url, re.I)
         if si_match:
             supplier_id = si_match.group(1)
             base_site = store_url.split('/si/')[0]
             return f"{base_site}/company-profile_{supplier_id}.htm", f"{base_site}/contact-us_{supplier_id}.htm"
 
-        # 3. 匹配二级域名根目录（补齐 .htm）
         clean_base = store_url.rstrip('/')
         return f"{clean_base}/company-profile.htm", f"{clean_base}/contact-us.htm"
 
@@ -63,22 +59,17 @@ class GlobalSources(BaseCrawler):
         return ""
 
     def _extract_field_from_text(self, text: str, label_patterns: list[str], stop_words: list[str]) -> str:
-        """
-        根据标签智能提取单行或换行值，避免大段非贪婪跨行导致的丢失
-        """
         if not text:
             return ""
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         for i, line in enumerate(lines):
             for pat in label_patterns:
-                # 场景 A: 同一行 "Registered Company: XXX"
                 m = re.match(rf'^{pat}\s*[:：]\s*(.+)$', line, re.I)
                 if m:
                     cand = m.group(1).strip()
                     if cand and not any(sw.lower() in cand.lower() for sw in stop_words):
                         return self.clean_token(cand)
 
-                # 场景 B: 标签独占一行，下一行为具体内容
                 if re.match(rf'^{pat}\s*[:：]?$', line, re.I):
                     if i + 1 < len(lines):
                         next_line = lines[i + 1].strip()
@@ -102,7 +93,6 @@ class GlobalSources(BaseCrawler):
         )
 
         home_html = ""
-        # 兜底：若子页打不开，拉取店铺首页找真实导航链接
         if not profile_html or not contact_html:
             home_html = await self._fetch_html(client, store_url)
             if home_html:
@@ -119,15 +109,7 @@ class GlobalSources(BaseCrawler):
         contact_text = self.html_to_clean_text(contact_html)
         home_text = self.html_to_clean_text(home_html) if home_html else ""
 
-        # ==========================================
-        # 1. 提取公司法定名称 (优先 profile, 备选 contact, 再次 home)
-        # ==========================================
-        comp_labels = [
-            r'Registered\s*Company(?:\s*Name)?',
-            r'Company\s*Name',
-            r'Legal\s*Business\s*Name',
-            r'Business\s*Name'
-        ]
+        comp_labels = [r'Registered\s*Company(?:\s*Name)?', r'Company\s*Name', r'Legal\s*Business\s*Name', r'Business\s*Name']
         stop_words = ["registration number", "business type", "year established", "country", "view more", "undefined", "null"]
 
         info["registered_company"] = self._extract_field_from_text(profile_text, comp_labels, stop_words)
@@ -136,18 +118,9 @@ class GlobalSources(BaseCrawler):
         if not info["registered_company"] and home_text:
             info["registered_company"] = self._extract_field_from_text(home_text, comp_labels, stop_words)
 
-        # ==========================================
-        # 2. 提取公司注册地址 (优先 profile, 备选 contact, 再次 home)
-        # ==========================================
         addr_labels = [
-            r'Company\s*Registration\s*Address',
-            r'Registered\s*Address',
-            r'Registration\s*Address',
-            r'Operational\s*Address',
-            r'Factory\s*Address',
-            r'Business\s*Address',
-            r'Office\s*Address',
-            r'Address'
+            r'Company\s*Registration\s*Address', r'Registered\s*Address', r'Registration\s*Address',
+            r'Operational\s*Address', r'Factory\s*Address', r'Business\s*Address', r'Office\s*Address', r'Address'
         ]
         addr_stops = ["zip code", "country/region", "view more", "view less", "null", "production capacity", "* in china"]
 
@@ -157,27 +130,20 @@ class GlobalSources(BaseCrawler):
         if not info["registered_address"] and home_text:
             info["registered_address"] = self._extract_field_from_text(home_text, addr_labels, addr_stops)
 
-        # ==========================================
-        # 3. 提取企业独立站官网 (在 contact / profile / home 中查找)
-        # ==========================================
         for candidate_text in [contact_text, profile_text, home_text]:
-            if info["official_website"]:
-                break
+            if info["official_website"]: break
             other_m = re.search(r'Other\s+(?:homepage\s+)?website\s*[:：]?\s*([^\s\r\n<"\'>]+)', candidate_text, re.I)
             if other_m:
                 cand = self.normalize_website(other_m.group(1), exclude_domain="globalsources.com")
-                if cand:
-                    info["official_website"] = cand
+                if cand: info["official_website"] = cand
 
         if not info["official_website"]:
             for cand_html in [contact_html, profile_html, home_html]:
-                if info["official_website"] or not cand_html:
-                    break
+                if info["official_website"] or not cand_html: break
                 html_m = re.search(r'Other\s+(?:homepage\s+)?website[\s\S]*?(?:href=["\']([^"\']+)["\']|>([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}[^<\s]*))', cand_html, re.I)
                 if html_m:
                     cand = self.normalize_website(html_m.group(1) or html_m.group(2), exclude_domain="globalsources.com")
-                    if cand:
-                        info["official_website"] = cand
+                    if cand: info["official_website"] = cand
 
         return info
 
@@ -223,8 +189,7 @@ class GlobalSources(BaseCrawler):
 
                 page_added = 0
                 for el in candidate_elements:
-                    if len(candidate_sellers) >= max_count:
-                        break
+                    if len(candidate_sellers) >= max_count: break
 
                     href = await el.get_attribute("href") or ""
                     if any(pk in href.lower() for pk in ["/pdtl/", "/product_", "productdetail", "/product/"]):
@@ -235,8 +200,7 @@ class GlobalSources(BaseCrawler):
                     comp_name = title_attr if self.is_valid_company_name(title_attr) else text
                     clean_url = self._format_clean_url(href).rstrip('/')
 
-                    if dedup.is_seen(comp_name):
-                        continue
+                    if dedup.is_seen(comp_name): continue
 
                     if self.is_valid_company_name(comp_name) and comp_name not in seen_companies and href:
                         seen_companies.add(comp_name)
@@ -287,6 +251,4 @@ class GlobalSources(BaseCrawler):
                     )
 
             tasks = [process_item(i, seller) for i, seller in enumerate(candidate_sellers, 1)]
-            results = await asyncio.gather(*tasks)
-
-        return results
+            return await asyncio.gather(*tasks)
