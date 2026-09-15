@@ -3,6 +3,7 @@ import asyncio
 import random
 from core.browser import ensure_chrome_running, is_port_open
 from models import RawSupplierLead
+from utils.ratelimit import AsyncRateLimiter
 from utils.text import clean_token, html_to_clean_text, is_valid_company_name, normalize_website
 
 class BaseCrawler(ABC):
@@ -12,6 +13,11 @@ class BaseCrawler(ABC):
     def __init__(self, cdp_port: int = 9222, concurrency: int = 4):
         self.cdp_port = cdp_port
         self.concurrency = concurrency
+        # 全站请求节奏：详情页是 httpx 并发抓取，必须限速。
+        # 说明：legacy 早期版本有这个限速器，重写时被漏掉了 —— 于是 concurrency=4、
+        # 每个商户内部再并发抓 profile+contact，瞬时最多 8 个请求零间隔打向同一站点，
+        # 会被限流/拒绝；而抓取失败又被静默吞掉，表现为"整列字段空白且看不出原因"。
+        self._rate_limiter = AsyncRateLimiter(min_interval=1.2, jitter=0.35)
 
     def is_port_open(self, host: str = "127.0.0.1") -> bool:
         return is_port_open(host=host, port=self.cdp_port)

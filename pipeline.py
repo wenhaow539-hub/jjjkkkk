@@ -8,7 +8,7 @@ from playwright.async_api import async_playwright
 import config
 from core.browser import ensure_chrome_running
 from core.factory import CrawlerFactory
-import crawlers  # 激活各平台爬虫注册
+import crawlers
 from enrichers.evaluator import EvaluatedSupplier, evaluate_supplier_icp
 from enrichers.tianyancha import TianyanchaEnricher
 from enrichers.website import WebsiteEnricher
@@ -22,6 +22,7 @@ logger = get_logger("pipeline")
 def _default_eval(lead: RawSupplierLead) -> EvaluatedSupplier:
     return EvaluatedSupplier(
         clean_company_name=lead.registered_company or "",
+        industry="通用制造业",
         is_factory=True,
         confidence_score=0.8,
         summary="未执行大模型质检或降级回退",
@@ -71,7 +72,6 @@ async def run_pipeline(
     logger.info(f"🌐 目标平台: {platform} | 关键词: {keyword} | 本次计划采集: {max_count}")
     logger.info("=======================================================")
 
-    # 1. 爬取商户初筛数据（只处理本次抓取到的商户，不加载任何历史断点）
     crawler = CrawlerFactory.get_crawler(platform)
     fresh_leads: list[RawSupplierLead] = await crawler.scrape(keyword=keyword, max_count=max_count)
 
@@ -90,7 +90,7 @@ async def run_pipeline(
         pending = list(records.values())
         logger.info(f"\n🌐 [Enrichment 1/2] 异步穿透独立站探测商业邮箱、官网联系方式与备案... (本次处理 {len(pending)} 家)")
         enricher = WebsiteEnricher(concurrency=5)
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=10.0) as client:
 
             async def enrich_one(rec: dict):
                 lead = RawSupplierLead(**rec["lead"])
@@ -98,7 +98,7 @@ async def run_pipeline(
                     s_res = await enricher.enrich_lead(client, lead.official_website)
                 except Exception as e:
                     logger.warning(f"      ⚠️ [独立站探测异常] {lead.company} ({e!r})")
-                    s_res = {"email": "", "site_phone": "", "icp": "网址探测异常"}
+                    s_res = {"email": "", "site_phone": "", "icp": "网址打不开"}
                 rec["enrich"]["email"] = s_res.get("email", "")
                 rec["enrich"]["site_phone"] = s_res.get("site_phone", "")
                 rec["enrich"]["icp"] = s_res.get("icp", "无")
@@ -106,9 +106,9 @@ async def run_pipeline(
 
             await asyncio.gather(*[enrich_one(rec) for rec in pending])
 
-    # 3. 大模型工商质检
+    # 3. 大模型工商质检与行业归纳
     eval_pending = list(records.values())
-    logger.info(f"\n🧠 [LLM 质检] 调用 DeepSeek 模型规范工商全称... (本次处理 {len(eval_pending)} 家)")
+    logger.info(f"\n🧠 [LLM 质检] 调用 DeepSeek 模型规范工商全称与主营行业归纳... (本次处理 {len(eval_pending)} 家)")
     for idx, rec in enumerate(eval_pending, 1):
         lead = RawSupplierLead(**rec["lead"])
         try:
@@ -122,7 +122,7 @@ async def run_pipeline(
             logger.warning(f"      ⚠️ [{idx}/{len(eval_pending)}] 质检跳过异常: {lead.company} ({e})")
             eval_res = _default_eval(lead)
         display_name = eval_res.clean_company_name or "无官方中文名/离岸主体"
-        logger.info(f"      ✨ [{idx}/{len(eval_pending)}] 质检提纯: {lead.company} -> {display_name}")
+        logger.info(f"      ✨ [{idx}/{len(eval_pending)}] 质检结果: {lead.company} -> {display_name} | 行业: 【{eval_res.industry}】")
         rec["eval"] = eval_res.model_dump()
         rec["llm_evaluated"] = True
 
@@ -199,4 +199,4 @@ async def run_pipeline(
 
 
 if __name__ == "__main__":
-    asyncio.run(run_pipeline(keyword="monitor", max_count=3, enrich_websites=True, enrich_tianyancha=True))
+    asyncio.run(run_pipeline(keyword="chair", max_count=3, enrich_websites=True, enrich_tianyancha=True))

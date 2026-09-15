@@ -1,17 +1,50 @@
-
 import json
+import re
 from openai import AsyncOpenAI
-from pydantic import BaseModel
-from models import RawSupplierLead
-from utils.logger import get_logger
+from pydantic import BaseModel, Field
 
-logger = get_logger("evaluator")
+from models import RawSupplierLead
+
 
 class EvaluatedSupplier(BaseModel):
-    clean_company_name: str = ""
-    is_factory: bool = True
-    confidence_score: float = 1.0
-    summary: str = ""
+    clean_company_name: str = Field(default="", description="规范后的中国大陆法定工商全称")
+    industry: str = Field(default="", description="归纳总结的细分行业标签(4-8字，如：LED照明、办公家具等)")
+    is_factory: bool = Field(default=True, description="是否属于实体生产制造型工厂")
+    confidence_score: float = Field(default=0.8, description="可信度评分")
+    summary: str = Field(default="", description="简短评析")
+
+
+SYSTEM_PROMPT = """你是一个专业的跨境供应链分析师。
+你的任务是根据供应商的英文名、现有中文名、主营产品(Main Products)或搜索词，完成两项核心工作：
+1. 【公司名规范】：推断其在国家工信部/工商局的中国大陆法定全称（例如 "Dongguan Huaruida Hardware Co., Ltd." 规范为 "东莞市华瑞达五金有限公司"）。若为海外离岸公司则保留原英文。
+2. 【所属行业归纳】：根据主营产品与品类，提炼出精准、专业的细分行业（如：LED商业照明、五金冲压件、3C数码配件、办公家具等，字数控制在4-8字以内）。
+
+必须且仅输出标准的 JSON 格式：
+{
+    "clean_company_name": "规范的中文公司名",
+    "industry": "细分行业名称",
+    "is_factory": true,
+    "confidence_score": 0.9,
+    "summary": "判定依据"
+}
+"""
+
+
+def _heuristic_industry_fallback(lead: RawSupplierLead) -> str:
+    """当大模型不可用时的规则词库兜底"""
+    text = f"{lead.raw_products} {lead.card_product} {lead.company}".lower()
+    if any(k in text for k in ["led", "light", "lamp", "bulb", "lighting"]):
+        return "LED照明设备"
+    if any(k in text for k in ["chair", "desk", "table", "furniture"]):
+        return "家具办公用品"
+    if any(k in text for k in ["audio", "speaker", "headphone", "earphone"]):
+        return "音频电子设备"
+    if any(k in text for k in ["metal", "hardware", "casting", "machining"]):
+        return "五金机械制造"
+    if any(k in text for k in ["solar", "battery", "energy"]):
+        return "新能源与电气"
+    return "电子科技制造"
+
 
 async def evaluate_supplier_icp(
     lead: RawSupplierLead,
@@ -19,53 +52,57 @@ async def evaluate_supplier_icp(
     base_url: str = "https://api.deepseek.com",
     model: str = "deepseek-chat"
 ) -> EvaluatedSupplier:
-    fallback_name = lead.registered_company or ""
-    default_result = EvaluatedSupplier(
-        clean_company_name=fallback_name,
-        is_factory=True,
-        confidence_score=0.8,
-        summary="未执行大模型质检或降级回退"
-    )
+    # 1. 基础 Key 校验
+    if not api_key or "sk-" not in api_key or "86fe" in api_key:
+        print(f"      ❌ [DeepSeek Key 异常] 当前 API Key 无效或未配置，已触发规则兜底！")
+        return EvaluatedSupplier(
+            clean_company_name=lead.registered_company or "",
+            industry=_heuristic_industry_fallback(lead),
+            is_factory=True,
+            confidence_score=0.5,
+            summary="API Key无效，规则兜底",
+        )
 
-    if not api_key or "your" in api_key.lower() or api_key.strip() == "":
-        return default_result
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
-    prompt = f"""你是一个严谨的外贸B2B工商数据审计员。请根据提供的商户信息，提炼其中国大陆工商局登记的标准法定中文全称。
+    products_info = lead.raw_products or lead.card_product or "未提供具体产品列表"
+    user_prompt = f"""
+供应商英文名: {lead.company}
+平台现有中文名: {lead.registered_company or '无'}
+主营产品(Main Products): {products_info}
+搜索关键词: {lead.card_product}
 
-【输入信息】：
-- 商户英文名: {lead.company}
-- 平台登记中文名: {lead.registered_company}
-- 注册地址: {lead.registered_address}
-- 官网网址: {lead.official_website}
-
-【严格执行规则】：
-1. 如果【平台登记中文名】已有内容，仅做规范化清洗（去除多余空格与标点）。
-2. 如果【平台登记中文名】为空：
-   - 严禁根据【注册地址】推测、联想或编造任何公司！因为写字楼/孵化器地址存在成百上千家共用企业！
-   - 除非英文名是极其明确的汉语拼音（如 "Shenzhen BYD Technology" -> "比亚迪"），否则必须直接输出空字符串 ""！
-3. 宁可留空，绝不能张冠李戴。
-
-请返回严格的 JSON 格式：
-{{
-  "clean_company_name": "清洗后的标准中文全称，若无法100%确定必须输出空字符串\"\"",
-  "is_factory": true或false,
-  "confidence_score": 0.0到1.0的置信度,
-  "summary": "判定依据"
-}}
+请判断其中国大陆法定全称，并归纳其所属行业。
 """
+
     try:
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=12.0)
         response = await client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "你是一个严谨的工商实体画像提取专家，只输出合法 JSON。"},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=0.0
+            temperature=0.1,
+            timeout=20.0
         )
-        data = json.loads(response.choices[0].message.content)
+        content = response.choices[0].message.content
+        data = json.loads(content)
         return EvaluatedSupplier(**data)
     except Exception as e:
-        logger.warning(f"      ⚠️ [LLM 质检跳过] {lead.company} 请求异常: {e}")
-        return default_result
+        err_msg = str(e)
+        if "401" in err_msg:
+            print(f"      🚨 [DeepSeek 401 认证失败] Key 已过期或错误: {err_msg}")
+        elif "402" in err_msg:
+            print(f"      🚨 [DeepSeek 402 余额不足] 账户额度已耗尽，请充值！")
+        else:
+            print(f"      ⚠️ [DeepSeek 请求超时/错误] {err_msg}")
+
+        # 出错时不再写死“通用制造业”，走关键词规则匹配
+        return EvaluatedSupplier(
+            clean_company_name=lead.registered_company or "",
+            industry=_heuristic_industry_fallback(lead),
+            is_factory=True,
+            confidence_score=0.5,
+            summary=f"质检降级: {err_msg[:30]}"
+        )

@@ -8,6 +8,8 @@ TARGET_COLUMNS = [
     "公司英文名",
     "平台网址",
     "公司中文名",
+    "所属行业",  # 👈 新增行业字段
+    "年限",
     "注册资本",
     "实缴资本",
     "参保人数",
@@ -37,8 +39,12 @@ def export_leads_to_excel(
     fallback_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for lead, enrich_res, eval_res in zip(leads_data, enriched_results, eval_results):
-        official_site = lead.official_website or ""
-        icp_status = enrich_res.get("icp", "无") if official_site else "无"
+        official_site = (lead.official_website or "").strip()
+
+        if not official_site:
+            icp_status = "无"
+        else:
+            icp_status = enrich_res.get("icp", "无") or "无"
 
         company_chinese = (
             enrich_res.get("registered_company")
@@ -49,11 +55,16 @@ def export_leads_to_excel(
         company_address = lead.registered_address or enrich_res.get("registered_address") or ""
         record_time = enrich_res.get("created_at") or fallback_time
 
+        # 提取 AI 归纳的细分行业
+        industry_val = getattr(eval_res, "industry", "") or ""
+
         new_rows.append({
             "平台名称": lead.platform,
             "公司英文名": lead.company,
             "平台网址": lead.store_url,
             "公司中文名": company_chinese,
+            "所属行业": industry_val,  # 👈 写入表格
+            "年限": getattr(lead, "platform_years", "") or "",
             "注册资本": enrich_res.get("registered_capital", "未公开"),
             "实缴资本": enrich_res.get("paid_in_capital", "未公开"),
             "参保人数": enrich_res.get("insured_count", "未公开"),
@@ -80,7 +91,6 @@ def export_leads_to_excel(
                 if col not in old_df.columns:
                     old_df[col] = ""
 
-            # 关键改动：old_df 在前，keep="first"，用户手工修改的数据绝对不被爬虫冲掉！
             merged_df = pd.concat([old_df[TARGET_COLUMNS], new_df], ignore_index=True)
             merged_df.drop_duplicates(subset=["平台网址"], keep="first", inplace=True)
             final_df = merged_df[TARGET_COLUMNS]
@@ -109,7 +119,7 @@ def export_leads_to_excel(
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
         text_cols = [
-            "官网联系方式", "天眼查联系方式", "email", "入库时间",
+            "所属行业", "年限", "官网联系方式", "天眼查联系方式", "email", "入库时间",
             "公司注册地址", "平台网址", "独立站", "网址是否有备案",
             "注册资本", "实缴资本", "参保人数",
         ]

@@ -1,7 +1,9 @@
 from typing import Optional
 from pydantic import BaseModel, Field
 
+
 class RawSupplierLead(BaseModel):
+    """第 1 层抓取的原始线索"""
     company: str
     platform: str = "Global Sources"
     store_url: str
@@ -14,8 +16,11 @@ class RawSupplierLead(BaseModel):
     raw_products: Optional[str] = ""
     detail_content: Optional[str] = ""
     card_product: str = ""
+    platform_years: Optional[str] = ""  # 👈 新增：平台年限 (如: "1 year", "2 years")
+
 
 class LLMEvalResult(BaseModel):
+    """第 2 层大模型质检与 ICP 匹配结果"""
     is_direct_factory: bool = Field(default=True, description="是否为源头实体工厂")
     icp_score: int = Field(default=5, ge=1, le=10, description="匹配打分(1-10分)")
     disqualify_reason: Optional[str] = Field(default=None, description="淘汰原因")

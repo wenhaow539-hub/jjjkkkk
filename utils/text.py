@@ -57,10 +57,22 @@ def normalize_website(url: str, exclude_domain: str = "") -> str:
     url = re.sub(r'[,;:\s<>"\'\)]+$', '', url.strip())
     if exclude_domain and exclude_domain.lower() in url.lower():
         return ""
-    if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.css', '.js', '.svg']):
+    # 站内相对路径不可能是"独立站"：必须挡在补协议之前，
+    # 否则 /favicon.ico 会被当成域名并补成 http://favicon.ico
+    if url.startswith(("/", "./", "../")):
+        return ""
+    if any(url.lower().endswith(ext) for ext in [
+        '.png', '.jpg', '.jpeg', '.gif', '.css', '.js', '.svg', '.webp',
+        '.ico', '.woff', '.woff2', '.ttf', '.eot', '.map', '.json', '.xml',
+    ]):
         return ""
     clean_domain = re.sub(r'^https?://', '', url).split('/')[0]
     if '.' not in clean_domain or len(clean_domain) < 4:
+        return ""
+    # 顶级域必须是纯字母（把 favicon.ico / xxx.js 这类"看起来像域名"的文件名挡住）；
+    # 放行 punycode（中文域名如 xn--fiqs8s）
+    tld = clean_domain.rsplit('.', 1)[-1]
+    if not re.fullmatch(r'[a-zA-Z]{2,}', tld) and not tld.lower().startswith('xn--'):
         return ""
     if not url.startswith("http://") and not url.startswith("https://"):
         url = f"https://{url}"

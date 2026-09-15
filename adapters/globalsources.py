@@ -18,6 +18,7 @@ legacy 实现仍保留在 crawlers/globalsources.py，未删除、未改动；
     company —— 公司资料页：解析工商名 / 注册地址 / 独立站 -> 合并后输出结构化记录
 """
 
+import html as html_lib
 import re
 from urllib.parse import quote_plus
 
@@ -555,22 +556,49 @@ class GlobalSourcesAdapter(BaseAdapter):
 
     @staticmethod
     def extract_official_website(text: str, html: str) -> str:
-        """迁移自 legacy 的独立站提取：先查文本中的 "Other website:"，再查 HTML 中的链接。"""
+        """独立站提取：先查纯文本标签值，再查 HTML 区块。
+
+        顺序很重要（实测教训）：contact 页里标签紧邻的值是**纯文本**而非链接——
+            <div class="contact-label">Other homepage website:</div>
+            <div class="contact-value">www.gasolutions.cn</div>
+        如果先去窗口里扫 href，会命中窗口内的 `/favicon.ico`，取到 http://favicon.ico。
+        所以这里先取"标签紧邻值"，href 只作为兜底，且一律经 normalize_website 校验
+        （它会挡掉站内相对路径、静态资源后缀与非字母顶级域）。
+        """
+        # ① 纯文本：标签后紧跟的值
         other_m = re.search(r'Other\s+(?:homepage\s+)?website\s*[:：]?\s*([^\s\r\n<"\'>]+)', text or "", re.I)
         if other_m:
             cand = normalize_website(other_m.group(1), exclude_domain="globalsources.com")
             if cand:
                 return cand
 
-        if html:
-            html_m = re.search(
-                r'Other\s+(?:homepage\s+)?website[\s\S]*?(?:href=["\']([^"\']+)["\']|>([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}[^<\s]*))',
-                html, re.I,
-            )
-            if html_m:
-                cand = normalize_website(html_m.group(1) or html_m.group(2), exclude_domain="globalsources.com")
-                if cand:
-                    return cand
+        if not html:
+            return ""
+
+        # ② HTML 区块：先剥掉 script/style（页面里嵌的 JSON-LD 含 `"Website": "https://schema.org"`，
+        #    不剥掉会命中它并把 schema.org 当成独立站），再取标签后的小窗口：
+        #    优先"去标签后的第一个值"，href 仅兜底。
+        clean_html = re.sub(r'<(script|style|noscript|svg|head)\b[^>]*>.*?</\1>', ' ', html, flags=re.I | re.S)
+        label_m = re.search(
+            r'Other\s+(?:homepage\s+)?website(?=\s*[:：]|\s*</)', clean_html, re.I
+        )
+        if not label_m:
+            return ""
+        window = clean_html[label_m.end(): label_m.end() + 400]
+        nxt = re.search(r'class="(?:contact|profile|company)-label"', window, re.I)
+        if nxt:
+            window = window[: nxt.start()]
+
+        text_only = html_lib.unescape(re.sub(r'<[^>]+>', ' ', window))
+        for token in re.findall(r'(?:https?://|www\.)[^\s"\'<>]+', text_only, re.I):
+            cand = normalize_website(token, exclude_domain="globalsources.com")
+            if cand:
+                return cand
+
+        for href in re.findall(r'href=["\']([^"\']+)["\']', window, re.I):
+            cand = normalize_website(href, exclude_domain="globalsources.com")
+            if cand:
+                return cand
         return ""
 
     @staticmethod
