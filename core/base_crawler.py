@@ -23,7 +23,13 @@ class BaseCrawler(ABC):
         return is_port_open(host=host, port=self.cdp_port)
 
     def ensure_chrome_running(self, profile_dir: str = "./chrome_debug_profile"):
-        ensure_chrome_running(port=self.cdp_port, profile_dir=profile_dir, platform_name=self.platform_name)
+        # 必须把实际端口写回 self.cdp_port：当 9222 被别的程序占用时，
+        # ensure_chrome_running 会自动改用其它端口，scrape() 里的 connect_over_cdp
+        # 以及 pipeline 的天眼查阶段都依赖 self.cdp_port，不回写就会连错端口。
+        self.cdp_port = ensure_chrome_running(
+            port=self.cdp_port, profile_dir=profile_dir, platform_name=self.platform_name
+        )
+        return self.cdp_port
 
     async def human_delay(self, min_sec: float = 1.5, max_sec: float = 3.0, desc: str = ""):
         sleep_time = round(random.uniform(min_sec, max_sec), 2)

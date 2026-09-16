@@ -117,10 +117,14 @@ def captcha_status() -> str:
     """只暴露"配置是否就绪"与尾号，不泄露密钥本体（与 api_key_status 同规约）。"""
     provider = auto_captcha_provider()
     if provider == "yunma":
-        return f"平台=云码，token 已配置（...{YUNMA_TOKEN[-4:]}，type={YUNMA_TYPE}）"
+        if YUNMA_TOKEN:
+            return f"平台=云码，token 已配置（...{YUNMA_TOKEN[-4:]}，type={YUNMA_TYPE}）"
+        return "平台=云码（显式指定），但 YUNMA_TOKEN 为空 → 退化为人工等待"
     if provider == "ttshitu":
-        return (f"平台=图鉴，账号已配置（...{TTSHITU_USERNAME[-3:]}，"
-                f"typeid={TTSHITU_TYPEID}）")
+        if TTSHITU_USERNAME and TTSHITU_PASSWORD:
+            return (f"平台=图鉴，账号已配置（...{TTSHITU_USERNAME[-3:]}，"
+                    f"typeid={TTSHITU_TYPEID}）")
+        return "平台=图鉴（显式指定），但账号或密码为空 → 退化为人工等待"
     explicit = (CAPTCHA_PROVIDER or "").strip().lower()
     if explicit and explicit not in ("none", "off", "disabled", "auto"):
         return f"平台={explicit}，但凭据缺失或平台名未知 → 退化为人工等待"

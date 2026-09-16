@@ -49,7 +49,14 @@ class AiQiChaEnricher:
     #   天眼查：醒目框线提示 + `for _ in range(120): sleep(2)`（≈240s）+ 通过后缓和停顿
     #   爱企查原来只等 60s、提示也很弱，人对不上就会超时并被计成"环境异常"喂给熔断。
     CAPTCHA_WAIT_TIMEOUT = 240.0          # 人工等待上限（秒）；_resolve_wait 会用 config 覆盖
-    CAPTCHA_REST_AFTER_PASS = (3.23, 6.29)  # 验证通过后的缓和停顿（天眼查同款区间）
+    # 验证通过后的缓和停顿。天眼查同款是 (3.23, 6.29)，但爱企查实测：过码后只缓 3~6 秒
+    # 就紧接着翻结果/进详情，"过了一个码立刻又弹一个"——刚过完码的会话在风控眼里仍是
+    # 高危会话，必须把第一段缓和拉长。配合 CAPTCHA_COOLDOWN_AFTER_PASS 一起起作用。
+    CAPTCHA_REST_AFTER_PASS = (6.0, 10.0)
+    # 过码通过后的**冷却窗口**（秒）：从通过那一刻起算。在窗口内发起的真实导航
+    # （打开搜索页 / 进入详情页）都会先补足剩余冷却——这是防"连续弹码"的关键，
+    # 因为弹一次码的代价（取图+识别+拖动，甚至转人工 240s）远大于多等几秒。
+    CAPTCHA_COOLDOWN_AFTER_PASS = (9.0, 15.0)
     CAPTCHA_WAIT_HINT_EVERY = 20.0        # 每隔多少秒打印一次等待进度
 
     # ── 百度安全验证（旋转验证码）选择器 ────────────────────────────────
@@ -279,6 +286,11 @@ class AiQiChaEnricher:
         "setup_date": ("成立日期", "成立时间"),
     }
 
+    # 「搜索结果页浏览完 → 点击进入企业详情」之间的随机停顿区间（秒）。
+    # 真人从看到搜索结果到点进某家企业，天然有数秒的不规则停顿；
+    # 固定间隔本身就是可检测的规律，所以取随机区间。
+    DETAIL_ENTER_DELAY = (3.0, 5.0)
+
     # 详情页结构化提取：DOM 键值对（.label / .person-title 的兄弟节点）
     # + 纯文本「标签 [冒号可选] 值」。两者合并，各取所长。
     # 说明：法定代表人节点后面先是头像首字（如「李」），名字在同一行的下一个兄弟节点，
@@ -426,6 +438,8 @@ class AiQiChaEnricher:
             self.captcha_landing_jitter = 0.0
         self._solver: CaptchaSolver | None = None
         self._solver_resolved = False
+        # 过码冷却：monotonic 时间戳。0 = 不在冷却期。见 CAPTCHA_COOLDOWN_AFTER_PASS。
+        self._captcha_cool_until = 0.0
 
     # ------------------------------------------------------------------ #
     # 基础设施
@@ -629,7 +643,7 @@ class AiQiChaEnricher:
             if time.monotonic() >= deadline:
                 logger.debug(f"[爱企查] 验证码控件 {timeout:.0f}s 内未判定为就绪，仍尝试取图: {last}")
                 return False
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.2)
 
     def _resolve_wait(self, timeout: float | None) -> float:
         """把"人工等待秒数"的 None（用配置默认）解析成具体秒数；<=0 表示不等待。"""
@@ -660,6 +674,7 @@ class AiQiChaEnricher:
         if self.captcha_mode == "auto":
             if await self._auto_solve_captcha(page):
                 await self._comfort_rest("自动过码通过后的缓和停顿")
+                self._arm_captcha_cooldown("自动过码")
                 return True
             if self._get_solver() is None:
                 print("      ℹ️ [爱企查] 未启用打码平台（.env 未配凭据）→ 转人工等待")
@@ -669,6 +684,7 @@ class AiQiChaEnricher:
         if timeout and timeout > 0:
             if await self._manual_wait_captcha(page, timeout):
                 await self._comfort_rest("人工验证通过后的缓和停顿")
+                self._arm_captcha_cooldown("人工过码")
                 return True
             return False
 
@@ -725,7 +741,7 @@ class AiQiChaEnricher:
         return False
 
     async def _comfort_rest(self, desc: str) -> None:
-        """验证通过后的缓和停顿（对齐天眼查的 `_human_rest(3.23, 6.29, "验证通过缓和停顿")`）。
+        """验证通过后的缓和停顿（比天眼查的 (3.23, 6.29) 更长，理由见常量注释）。
 
         作用不是"装样子"：刚过完验证就立刻发下一个请求，最容易立刻再被拦。
         """
@@ -733,6 +749,27 @@ class AiQiChaEnricher:
         sec = round(random.uniform(lo, hi), 2)
         print(f"      ⏱️ [爱企查缓和停顿] {desc}，等待 {sec} 秒...")
         await asyncio.sleep(sec)
+
+    def _arm_captcha_cooldown(self, source: str) -> None:
+        """过码通过时启用冷却窗口（本次会话内的下一次真实导航会被拦下补足）。"""
+        lo, hi = self.CAPTCHA_COOLDOWN_AFTER_PASS
+        self._captcha_cool_until = time.monotonic() + random.uniform(lo, hi)
+        logger.debug(f"[爱企查] {source}通过，已启用导航冷却窗口")
+
+    async def _respect_captcha_cooldown(self, desc: str) -> None:
+        """真实导航（打开搜索页/进详情页）前补足过码冷却。
+
+        这是"过了一个验证码立刻又弹一个"的直接对策：刚过完码的会话立刻高频
+        导航，是风控再次弹码的最强信号。冷却没走完就先补足（带少量抖动，
+        避免"冷却一结束瞬间就发起导航"这种新的规律）。
+        """
+        wait = self._captcha_cool_until - time.monotonic()
+        if wait <= 0:
+            return
+        wait += random.uniform(0.0, 1.5)
+        print(f"      ⏱️ [爱企查] {desc}前冷却补足 {wait:.1f} 秒（刚过完验证码，放缓防再弹）")
+        await asyncio.sleep(wait)
+        self._captcha_cool_until = 0.0
 
     # ---- 自动打码 ------------------------------------------------------ #
     def _get_solver(self) -> CaptchaSolver | None:
@@ -1058,7 +1095,7 @@ class AiQiChaEnricher:
         """拖动后等结果：滑块**确实**消失 / 页面跳走 = 通过；超时仍显示 = 未通过。"""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.25)
             try:
                 if page.is_closed():
                     return True
@@ -1115,7 +1152,7 @@ class AiQiChaEnricher:
                     return True          # 缓和停顿由 _handle_captcha 统一加
 
                 print(f"      ↻ [爱企查] 第 {attempt} 轮未通过，换新图重试")
-                await self._human_delay(1.2, 2.0)
+                await self._human_delay(0.8, 1.3)
             except CaptchaProviderError as e:
                 print(f"      ⚠️ [爱企查] 打码平台错误: {e}")
                 return False
@@ -1266,7 +1303,8 @@ class AiQiChaEnricher:
             # （undefined / false 冲突），已合并进 ANTI_DEBUG_SCRIPT。
             await page.add_init_script(self.ANTI_DEBUG_SCRIPT)
 
-            # 1) 搜索列表页
+            # 1) 搜索列表页（若刚过完验证码，先补足冷却窗口再导航）
+            await self._respect_captcha_cooldown("打开搜索页")
             await page.goto(self.SEARCH_URL.format(kw=quote_plus(clean_name)),
                             wait_until="domcontentloaded", timeout=35000)
             self.last_page_url = page.url
@@ -1317,7 +1355,16 @@ class AiQiChaEnricher:
             # 卡片本身已带法定代表人/注册资本/电话/邮箱，作为可靠兜底
             data.update(self._extract_all(card.get("text", ""), self.CARD_FIELDS))
 
+            # 进入企业详情前的随机停顿（3~5 秒）：模拟真人"看完结果再点进去"的节奏。
+            # 放在选卡之后、导航之前 —— 上一家详情页 → 本次搜索 → 停顿 → 进详情，
+            # 让相邻两次详情访问之间的间隔不再均匀。
+            delay = round(random.uniform(*self.DETAIL_ENTER_DELAY), 2)
+            print(f"      ⏱️ [爱企查] 进入企业详情前随机停顿 {delay} 秒...")
+            await asyncio.sleep(delay)
+
             # 3) 详情页（用 pid 直达；卡片 <a> 没有 href，无法走链接）
+            #    导航前先补足过码冷却 —— 详情页是"过码后立刻再弹码"的最高发位置
+            await self._respect_captcha_cooldown("进入企业详情页")
             detail_url = self.DETAIL_URL.format(pid=card["pid"])
             await page.goto(detail_url, wait_until="domcontentloaded", timeout=35000)
             self.last_page_url = page.url
