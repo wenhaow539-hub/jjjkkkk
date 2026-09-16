@@ -13,6 +13,7 @@ TARGET_COLUMNS = [
     "注册资本",
     "实缴资本",
     "参保人数",
+    "经营状态",  # 👈 新增（爱企查提供）
     "公司注册地址",
     "天眼查联系人",
     "天眼查联系人职位",
@@ -22,6 +23,7 @@ TARGET_COLUMNS = [
     "天眼查联系方式",
     "搜索的关键词",
     "email",
+    "数据来源",  # 👈 新增：爱企查 / 天眼查
     "入库时间",
 ]
 
@@ -32,7 +34,14 @@ def export_leads_to_excel(
     eval_results: list,
     keyword: str,
     output_file: str = "suppliers_leads.xlsx",
+    drop_urls: set | None = None,
 ) -> str:
+    """导出报表。
+
+    drop_urls：需要从**存量报表**里删除的「平台网址」集合（环球资源重爬后仍无中文名的行）。
+    之所以要在这里删而不是上游剔除：这些是**历史遗留行**，本轮根本没采集到它们
+    （指纹已在 seen_hashes.txt 里），只能靠主键从合并结果里摘掉。
+    """
     print("\n📊 [数据整理与导出] 正在写入 Excel 报表...")
 
     new_rows = []
@@ -68,6 +77,7 @@ def export_leads_to_excel(
             "注册资本": enrich_res.get("registered_capital", "未公开"),
             "实缴资本": enrich_res.get("paid_in_capital", "未公开"),
             "参保人数": enrich_res.get("insured_count", "未公开"),
+            "经营状态": enrich_res.get("business_status", ""),
             "公司注册地址": company_address,
             "天眼查联系人": enrich_res.get("contact_person", ""),
             "天眼查联系人职位": enrich_res.get("contact_title", ""),
@@ -77,11 +87,15 @@ def export_leads_to_excel(
             "天眼查联系方式": enrich_res.get("tyc_phone", ""),
             "搜索的关键词": keyword,
             "email": enrich_res.get("email", ""),
+            "数据来源": enrich_res.get("data_source", ""),
             "入库时间": record_time,
         })
 
-    new_df = pd.DataFrame(new_rows)[TARGET_COLUMNS]
+    # 本轮可能一条都没入库（例如全部因缺中文名被剔除），此时仍要能继续跑
+    # 「存量报表的删除/清理」——所以空表也要带齐列，否则后面的 concat 会炸。
+    new_df = pd.DataFrame(new_rows, columns=TARGET_COLUMNS) if new_rows else pd.DataFrame(columns=TARGET_COLUMNS)
 
+    removed_count = 0
     if os.path.exists(output_file):
         try:
             old_df = pd.read_excel(output_file, dtype=str)
@@ -91,10 +105,17 @@ def export_leads_to_excel(
                 if col not in old_df.columns:
                     old_df[col] = ""
 
+            old_keys = set(old_df["平台网址"].dropna().astype(str))
             merged_df = pd.concat([old_df[TARGET_COLUMNS], new_df], ignore_index=True)
             merged_df.drop_duplicates(subset=["平台网址"], keep="first", inplace=True)
+            if drop_urls:
+                before = len(merged_df)
+                merged_df = merged_df[~merged_df["平台网址"].astype(str).isin(drop_urls)]
+                removed_count = before - len(merged_df)
             final_df = merged_df[TARGET_COLUMNS]
-            added_count = len(final_df) - len(old_df)
+            # 旧行优先（keep=first）：真正新增数 = 本次行里“平台网址”未在旧表出现过的条数。
+            # 用行数相减会在列结构变化（新增列导致旧表重排）时失真，故改为按主键集合差计算。
+            added_count = sum(1 for u in new_df["平台网址"].astype(str) if u not in old_keys)
         except Exception:
             final_df = new_df
             added_count = len(new_df)
@@ -121,7 +142,7 @@ def export_leads_to_excel(
         text_cols = [
             "所属行业", "年限", "官网联系方式", "天眼查联系方式", "email", "入库时间",
             "公司注册地址", "平台网址", "独立站", "网址是否有备案",
-            "注册资本", "实缴资本", "参保人数",
+            "注册资本", "实缴资本", "参保人数", "经营状态", "数据来源",
         ]
         for col_idx, col_name in enumerate(final_df.columns, start=1):
             is_text = col_name in text_cols
@@ -135,4 +156,6 @@ def export_leads_to_excel(
 
     print(f"\n🎉 [流水线完成] 数据已入库: {target_path}")
     print(f"📈 累计总商户: {len(final_df)} 条 (本次真正新增入库: {max(0, added_count)} 条)")
+    if removed_count:
+        print(f"🗑️ 已从存量报表删除 {removed_count} 条（环球资源重爬后仍无中文工商名）")
     return target_path

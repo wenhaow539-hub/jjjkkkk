@@ -3,7 +3,7 @@ from pipeline import run_pipeline
 
 TARGET_PLATFORM = "globalsources"
 SEARCH_KEYWORD = "bag"
-SCRAPE_LIMIT = 5
+SCRAPE_LIMIT = 20
 OUTPUT_FILE = "suppliers_leads.xlsx"
 
 if __name__ == "__main__":

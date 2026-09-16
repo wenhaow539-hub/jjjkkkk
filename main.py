@@ -102,8 +102,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
     # --pipeline 专用
-    parser.add_argument("--no-enrich", action="store_true", help="--pipeline：跳过独立站探测与天眼查补全")
+    parser.add_argument("--no-enrich", action="store_true", help="--pipeline：跳过独立站探测与工商补全")
     parser.add_argument("--no-resume", action="store_true", help="--pipeline：不使用断点续采")
+    parser.add_argument("--enrich-source", choices=["aiqicha", "tianyancha", "both"], default="aiqicha",
+                        help="--pipeline：工商补全数据源（默认 aiqicha 爱企查；both=爱企查优先+天眼查兜底）")
+    parser.add_argument("--captcha-mode", choices=["auto", "manual", "off"], default="auto",
+                        help="--pipeline：验证码策略。auto=先自动打码（需 .env 配打码平台）失败转人工；"
+                             "manual=仅人工等待（改动前行为）；off=无人值守，命中即跳过该家（默认 auto）")
+    parser.add_argument("--captcha-provider", choices=["auto", "ttshitu", "yunma", "none"], default="auto",
+                        help="--pipeline：打码平台。auto=按 .env 里哪家凭据齐全自动选（默认）；none=禁用自动打码")
+    parser.add_argument("--keep-missing-name", action="store_true",
+                        help="--pipeline：保留环球资源未爬到中文工商名的商户（默认重爬一次仍无则剔除/删除）")
+    parser.add_argument("--captcha-wait", type=float, default=None,
+                        help="--pipeline：人工等待验证码的秒数（默认取 .env 的 CAPTCHA_WAIT_SECONDS，即 240；0=不等待）")
     parser.add_argument("--refresh", action="store_true",
                         help="忽略历史指纹库，强制重采已采集过的公司（默认会跳过并给出提示）")
     parser.add_argument("--all-browser", action="store_true",
@@ -220,6 +231,7 @@ async def run_pipeline_entry(args) -> int:
     logger.info(
         f"🚀 [main] pipeline 模式（委派 run_pipeline）| 平台={platform} | 关键词={args.keyword} | "
         f"上限={args.limit} | 输出={args.output} | 增强={'关' if args.no_enrich else '开'} | "
+        f"工商数据源={args.enrich_source} | 验证码={args.captcha_mode}({args.captcha_provider}) | "
         f"断点续采={'关' if args.no_resume else '开'}"
     )
     await run_pipeline(
@@ -229,7 +241,12 @@ async def run_pipeline_entry(args) -> int:
         output_file=args.output,
         enrich_websites=not args.no_enrich,
         enrich_tianyancha=not args.no_enrich,
+        enrich_source=args.enrich_source,
         resume=not args.no_resume,
+        captcha_mode=args.captcha_mode,
+        captcha_provider=args.captcha_provider,
+        captcha_wait=args.captcha_wait,   # None → 由 config.CAPTCHA_WAIT_SECONDS 决定
+        drop_missing_name=not args.keep_missing_name,
     )
     return 0
 

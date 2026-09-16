@@ -14,6 +14,22 @@ from utils.logger import get_logger
 
 logger = get_logger("crawler.gs")
 
+# Cookie 头的安全上限（字节）。GS 在请求头过大时直接返回 400 Request Header Or Cookie Too Large。
+# 实测：把浏览器所有域的 cookie 全带上 = 16KB → 400；只带 GS 自己的 = 2.4KB → 200。
+COOKIE_HEADER_LIMIT = 6000
+
+# 复核历史行时没有浏览器可拿 UA，用这个兜底（与常见 Chrome 一致）。
+# 实测详情页不带 cookie 也返回 200，所以复核请求可以不开浏览器。
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+# 「无中文工商名 → 重爬一次」前的冷却（秒）。
+# 空值的主因是 403/429 限流与超时；立刻连发第二个请求等于再撞一次墙，
+# 给它一点恢复时间才有意义。
+NAME_RETRY_COOLDOWN = (2.0, 4.0)
+
 
 @CrawlerFactory.register("globalsources")
 class GlobalSources(BaseCrawler):
@@ -139,6 +155,13 @@ class GlobalSources(BaseCrawler):
                 if resp.status_code == 200:
                     return resp.text
                 last_error = f"HTTP {resp.status_code}"
+                if resp.status_code == 400:
+                    # 实测：cookie 头过大时 GS 直接 400。把服务端的原话带出来，避免又花时间猜。
+                    if "Too Large" in (resp.text or ""):
+                        last_error = "HTTP 400(Request Header Or Cookie Too Large → Cookie 头过大)"
+                    else:
+                        last_error = "HTTP 400(请求被拒，常见原因：Cookie 头过大或请求头异常)"
+                    break
                 if resp.status_code in (403, 429, 503):
                     await asyncio.sleep(max(1.5, 1.5 * (attempt + 1)))
                     continue
@@ -275,6 +298,18 @@ class GlobalSources(BaseCrawler):
         if not info["registered_company"]:
             info["registered_company"] = self._extract_field_from_text(contact_text, comp_labels, stop_words)
 
+        # 兜底：**直接用平台网址本身再解析一次**。
+        # store_url 是列表页 <a href> 直接给的，一定可靠；而 profile/contact 是我们
+        # 按规则拼出来的（`company-profile_<id>.htm` / `.../company-profile.htm`），
+        # 站点改版或 URL 形态没覆盖到时就是 404/403 —— 这两页一空，中文名就没了。
+        # 中文工商名是整条记录的命脉（缺了整行作废），所以值得为它多抓一次原始页。
+        if not info["registered_company"]:
+            if not home_html:
+                home_html = await self._fetch_html(client, store_url)
+                home_text = self.html_to_clean_text(home_html) if home_html else ""
+            if home_text:
+                info["registered_company"] = self._extract_field_from_text(home_text, comp_labels, stop_words)
+
         # 2. 提取注册地址
         addr_labels = [
             r'Company\s*Registration\s*Address', r'Registered\s*Address', r'Registration\s*Address',
@@ -305,6 +340,46 @@ class GlobalSources(BaseCrawler):
             )
 
         return info
+
+    async def refetch_company_names(self, store_urls: list[str]) -> dict[str, str]:
+        """对指定店铺 URL 重抓一次详情页，只取中文工商名（URL → 名称，取不到为空串）。
+
+        存在的理由：**历史遗留的「无中文名」行没法靠正常采集挽救** ——
+        这些公司的指纹早就写进 seen_hashes.txt，`is_seen()` 恒真，采集阶段永远跳过它们。
+        唯一能做的，就是拿着 Excel 里的「平台网址」直接回锅重抓。
+
+        不用浏览器：实测详情页不带 cookie 同样返回 200，所以这里自建 httpx 客户端即可，
+        省掉一次 CDP 附着（附着还可能被卡死标签页挡住）。
+        """
+        urls = []
+        for u in (store_urls or []):
+            u = (u or "").strip()
+            if u.startswith("http") and u not in urls:
+                urls.append(u)
+        if not urls:
+            return {}
+
+        headers = {
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8",
+        }
+        semaphore = asyncio.Semaphore(self.concurrency)
+        result: dict[str, str] = {}
+
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15.0) as client:
+            async def one(u: str):
+                async with semaphore:
+                    try:
+                        detail = await self._parse_detail(client, u)
+                    except Exception as e:
+                        logger.warning(f"⚠️ [GS] 复核抓取异常: {u} ({e!r})")
+                        return u, ""
+                    return u, (detail.get("registered_company") or "").strip()
+
+            for u, name in await asyncio.gather(*[one(u) for u in urls]):
+                result[u] = name
+        return result
 
     async def scrape(
         self,
@@ -418,8 +493,24 @@ class GlobalSources(BaseCrawler):
                     page_num += 1
                     await self.human_delay(1.5, 2.5, desc="翻页冷却")
 
-            raw_cookies = await context.cookies()
-            session_cookies = {c['name']: c['value'] for c in raw_cookies}
+            # ⚠️ 必须按域名过滤：`context.cookies()` 不带参数会返回**浏览器里所有域**的 cookie。
+            # 实测本机该浏览器累积了 276 条（globalsources / alibaba / aiqicha / tianyancha / baidu / qcc …），
+            # 全部拼进 Cookie 头达 16KB，GS 直接返回 400 Request Header Or Cookie Too Large，
+            # 表现为"独立站/中文工商名/注册地址整列为空"，而 GS 代码本身一行没改也会突然坏。
+            raw_cookies = await context.cookies("https://www.globalsources.com")
+            session_cookies = {
+                c["name"]: c["value"]
+                for c in raw_cookies
+                if "globalsources.com" in (c.get("domain") or "")
+            }
+            cookie_size = len("; ".join(f"{k}={v}" for k, v in session_cookies.items()))
+            if cookie_size > COOKIE_HEADER_LIMIT:
+                # 兜底：即使过滤后仍超限（自己站点 cookie 太多），宁可不带 cookie —— 实测不带也返回 200
+                logger.warning(f"⚠️ [GS] globalsources cookie 头达 {cookie_size} 字节，超过 {COOKIE_HEADER_LIMIT} 上限，"
+                               f"本次详情请求不带 cookie（实测不影响取数）")
+                session_cookies = {}
+            else:
+                logger.debug(f"[GS] 详情请求将携带 {len(session_cookies)} 条 GS cookie（{cookie_size} 字节）")
             user_agent = await page.evaluate("navigator.userAgent")
 
             try:
@@ -462,6 +553,41 @@ class GlobalSources(BaseCrawler):
 
             tasks = [process_item(i, seller) for i, seller in enumerate(candidate_sellers, 1)]
             leads = await asyncio.gather(*tasks)
+
+            # ——「未取到中文工商名 → 同轮内立即重爬一次」——
+            # 空值主因是 403/429 限流与超时（页面本身没这个字段的情况也存在，
+            # 重抓正好能区分：HTTP 正常但仍为空 ⇒ 页面没有，不是我们被拒）。
+            # 复用同一个 client：cookie/UA 都已就绪，不必为了重试再开一次浏览器。
+            missing_idx = [i for i, ld in enumerate(leads) if not (ld.registered_company or "").strip()]
+            if missing_idx:
+                print(f"🔁 [{self.platform_name}] {len(missing_idx)} 家未取到中文工商名，同轮内立即重爬一次...")
+                await self.human_delay(*NAME_RETRY_COOLDOWN, desc="重爬冷却")
+
+                async def _retry_one(i: int):
+                    async with semaphore:
+                        return i, await self._parse_detail(client, leads[i].store_url)
+
+                recovered = 0
+                for i, detail in await asyncio.gather(*[_retry_one(i) for i in missing_idx]):
+                    name = (detail.get("registered_company") or "").strip()
+                    if not name:
+                        continue
+                    leads[i].registered_company = name
+                    # 顺带把同一次重抓里拿到的其它字段补上（仅在原值为空时写，不覆盖已有值）
+                    if not leads[i].registered_address:
+                        leads[i].registered_address = detail.get("registered_address", "")
+                    if not leads[i].official_website:
+                        leads[i].official_website = detail.get("official_website", "")
+                    dedup.add(name)   # 与 process_item 保持一致：补到的中文名也进指纹库
+                    recovered += 1
+
+                print(f"      ↳ 重爬补回中文工商名 {recovered}/{len(missing_idx)} 家")
+                if recovered < len(missing_idx):
+                    logger.warning(
+                        f"⚠️ [GS] 重爬后仍有 {len(missing_idx) - recovered} 家无中文工商名，将按策略剔除（不入库）。"
+                        f"判定依据：上方若有『详情页抓取失败』告警 = 被限流/超时；"
+                        f"若无告警但 profile/contact 字节数正常 = 页面本身没有该字段。"
+                    )
 
         # 详情阶段小结：把"独立站取到几家/工商名取到几家"显式说出来。
         # 之前这一层完全没有汇总，字段空着也看不出是解析问题还是抓取被拒。

@@ -104,6 +104,91 @@ class WebsiteEnricher:
         text = re.sub(r'[ \t]+', ' ', text)
         return text
 
+    # 国内 2 位区号（去掉前导 0 后）。写全是为了把 65/44 这类境外国家码挡在门外——
+    # 否则 "+65 90656597" 会被当"65 区号 + 8 位本地号"认成国内座机。
+    CN_AREA2 = {"10", "20", "21", "22", "23", "24", "25", "27", "28", "29"}
+
+    def _canon_phone(self, raw: str) -> str:
+        """把任意写法的号码归一成规范串；判断不出是电话就返回 ''。
+
+        归一化不只是为了好看：
+          · `86-20-31477658` 原样输出会变 `20-31477658`，区号前导 0 丢了就是个不存在的号码；
+          · `+44 7354893854` 被国内座机规则切成 `44-73548938` 是**半截号**，
+            半截号比留空更糟（会让人白打），所以境外号一律整串保留。
+        """
+        s = (raw or "").strip()
+        if not s:
+            return ""
+        raw_groups = re.findall(r"\d+", s)      # 保留原始分组，用来识别三段式 ID
+        s = re.sub(r"[^\d+;]", "", s)
+        ext = ""
+        if ";" in s:
+            s, ext = s.split(";", 1)
+        if s.startswith("00"):
+            s = "+" + s[2:]
+        is_intl = s.startswith("+")
+        d = re.sub(r"\D", "", s)
+        if not (7 <= len(d) <= 15):
+            return ""
+
+        if is_intl:
+            if d.startswith("86"):
+                d, is_intl = d[2:], False
+            else:
+                return "+" + d          # 境外号码：整体保留，不切分
+        elif d.startswith("86") and len(d) in (12, 13, 14):
+            d = d[2:]                   # 写了 86 但没写 +，如 8615913797691
+        elif len(d) >= 12 and not d.startswith("0"):
+            return "+" + d              # tel:447354893854 这类没写 + 的境外号
+
+        if re.fullmatch(r"[48]00\d{7}", d):
+            return f"{d[:3]}-{d[3:6]}-{d[6:]}"
+
+        area = ""
+        if d.startswith("0"):
+            # 三段式且每段都不超过 4 位 ⇒ 是 ID/日期不是座机（`010-2019-1688` 是 1688 店铺 slug）。
+            # 只卡 `0` 开头的分支，`132-0200-7108` 这种正常手机号分段不受影响。
+            if len(raw_groups) >= 3 and max(len(g) for g in raw_groups) <= 4:
+                return ""
+            # 不能用 `0(\d{2,3})(\d{7,8})` 一把梭：贪心会把 `02031477658` 拆成
+            # 区号 203 + 本地号 1477658（两个都"位数合法"但拼起来是错的）。
+            # 逐个候选切法试，取第一个区号真的存在的。
+            body, local = d[1:], ""
+            for alen in (3, 2):
+                if len(body) - alen in (7, 8):
+                    cand_area, cand_local = body[:alen], body[alen:]
+                    if len(cand_area) == 2 and cand_area in self.CN_AREA2:
+                        area, local = cand_area, cand_local
+                        break
+                    if len(cand_area) == 3 and cand_area[0] in "3456789":
+                        area, local = cand_area, cand_local
+                        break
+            else:
+                return ""
+        elif len(d) in (10, 11) and d[0] not in "01":
+            # 广东外贸站常见写法：769-81377158 / 20-31477658，区号不带前导 0
+            area, local = (d[:3], d[3:]) if len(d) == 11 else (d[:2], d[2:])
+        else:
+            local = ""
+
+        if area:
+            if len(area) == 2 and area not in self.CN_AREA2:
+                return ""
+            if len(area) == 3 and area[0] not in "3456789":
+                return ""
+            if not re.fullmatch(r"\d{7,8}", local):
+                return ""
+            out = f"0{area}-{local}"
+            return out + (f" 转{ext}" if ext else "")
+
+        if re.fullmatch(r"1[3-9]\d{9}", d):
+            if len(set(d)) <= 3:            # 11111111111 之类
+                return ""
+            if d.startswith(("1900", "202")):
+                return ""
+            return d
+        return ""
+
     def _extract_icp(self, text: str) -> str:
         if not text:
             return ""
@@ -153,52 +238,87 @@ class WebsiteEnricher:
                 clean_emails.append(e)
 
         # 3. 电话号码
-        phones = []
+        phones: list[str] = []
+        # 已占用的文本区间：防止同一串数字被多条规则各取一段，
+        # 拼出"半截号 + 重复号"这种最难排查的脏数据。
+        taken: list[tuple[int, int]] = []
 
-        # 手机号 (排除 14x 物联网与假号)
+        def _overlaps(s: int, e: int) -> bool:
+            return any(not (e <= a or s >= b) for a, b in taken)
+
+        def _add(num: str, span: tuple[int, int] | None = None) -> None:
+            if num and num not in phones:
+                phones.append(num)
+            if span:
+                taken.append(span)
+
+        # 3.1 <a href="tel:..."> 是页面上最可靠的电话来源，优先取
+        # 属性值里可能带空格（`tel:0086 15913797691`），所以只排除引号和 `>`
+        for m in re.finditer(r'href=["\']tel:([^"\'>]+)', raw_html, re.I):
+            _add(self._canon_phone(html.unescape(m.group(1))))
+
+        # 3.2 境外号码（+CC / 00CC，86 除外）：整串吞下，绝不让座机规则把它切半截
+        intl_pat = r'(?:\+|00)(?!86)[0-9]{1,3}[\s\-]+(?:\d[\s\-]?){5,13}\d'
+        for m in re.finditer(intl_pat, visible_text):
+            _add(self._canon_phone(m.group(0)), m.span())
+
+        # 3.3 手机号 (排除 14x 物联网与假号)
         mobile_pat = (
             r'(?:(?:\+|00)?86[\s\-]?)?'
             r'(1(?:3\d|5[0-35-9]|6[2567]|7[0-35-8]|8\d|9[0-35-9])'
             r'[\s\-]?\d{3,4}[\s\-]?\d{4})\b'
         )
         for m in re.finditer(mobile_pat, visible_text):
-            raw_num = m.group(1)
-            digits = re.sub(r'\D', '', raw_num)
-            if len(digits) == 11 and len(set(digits)) > 3 and not digits.startswith(('1900', '202')):
-                phones.append(digits)
+            if _overlaps(*m.span()):
+                continue
+            _add(self._canon_phone(m.group(1)), m.span())
 
-        # 固话座机 (兼容分机号)
+        # 3.4 固话座机 (兼容分机号)
+        # 两处收紧，都是实测踩出来的假号：
+        #  ① 本地号必须**连续 7~8 位**（原来允许 4+4 带分隔 → 页面 ID `010-2019-1688` 被当电话）；
+        #  ② 区号与本地号之间**必须有分隔符**（原来可选 → 内联 JSON 里的模块 UUID
+        #     `9139369130` 这种裸 10 位数字被当座机，实测 power-first.cn 就是这么中的）。
+        # 真实写法 `0755-27967077` / `769-81377158` / `86-20-31477658` 都不受影响。
         landline_pat = (
             r'(?:(?:TEL|Tel|Phone|电话|座机|TEL\.|Tel\.)\s*[:：.]?\s*)?'
             r'(?:(?:\+|00)?86[\s\-]?)?'
-            r'(\(?0?\d{2,3}\)?[\s\-]?(?:\d{7,8}|\d{3,4}[\s\-]\d{3,4}))'
+            r'(\(?0?\d{2,3}\)?[\s\-]\d{7,8})'
             r'((?:\s*[/,]\s*\d{7,8})*)'
         )
         for m in re.finditer(landline_pat, visible_text, re.I):
-            main_num = m.group(1).strip()
+            # 与已识别的号码**重叠**就跳过：否则会把同一串数字截断再加一遍 ——
+            # 实测 `0086-15913797691` 会被座机规则匹配成 `0086-15913797`（少了几位），
+            # 于是手机号后面跟了个假的"座机"。截断比漏认更糟（脏数据）。
+            if _overlaps(*m.span()):
+                continue
+            num = self._canon_phone(m.group(1))
+            if not num:
+                continue
             sub_nums = m.group(2).strip()
-            digits = re.sub(r'\D', '', main_num)
-            if 9 <= len(digits) <= 12 and not digits.startswith('1'):
-                cleaned = re.sub(r'[\s\-]+', '-', main_num)
-                if sub_nums:
-                    cleaned += " " + re.sub(r'\s+', '', sub_nums)
-                phones.append(cleaned)
+            if sub_nums:
+                num += " " + re.sub(r'\s+', '', sub_nums)
+            _add(num, m.span())
 
-        # 400/800 电话
+        # 3.5 400/800 电话
         for m in re.finditer(r'(?:(?:\+|00)?86[\s\-]?)?([48]00[\-\s]?\d{3,4}[\-\s]?\d{3,4})\b', visible_text):
-            h = re.sub(r'[\s\-]+', '-', m.group(1))
-            phones.append(h)
+            if _overlaps(*m.span()):
+                continue
+            _add(self._canon_phone(m.group(1)), m.span())
 
-        clean_phones = []
-        for p in phones:
-            if p not in clean_phones:
-                clean_phones.append(p)
+        clean_phones = list(phones)
 
         phone_str = " / ".join(clean_phones[:2]) if clean_phones else ""
         email_str = clean_emails[0] if clean_emails else ""
         return phone_str, email_str
 
     async def _fetch_html(self, client: httpx.AsyncClient, url: str) -> tuple[str, str, bool]:
+        """抓一页。返回 (html, 最终URL, 是否连通)。
+
+        **必须看状态码**：403/404/5xx 的错误页也是"有响应"的，但把它当成首页会出两个问题：
+        ① 拿错误页去提取，什么也提不到，还静默落到默认值（`icp="无"`），
+           把"网址打不开"这个有用的信号也吞掉；
+        ② 白跑后面 5 条 fallback 子页路径。
+        """
         try:
             resp = await client.get(
                 url,
@@ -206,6 +326,8 @@ class WebsiteEnricher:
                 timeout=15.0,
                 follow_redirects=True
             )
+            if resp.status_code >= 400:
+                return "", str(resp.url), False
             html_text = self._safe_decode(resp)
             return html_text, str(resp.url), True
         except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError):
