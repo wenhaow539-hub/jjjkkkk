@@ -17,7 +17,7 @@ from enrichers.tianyancha import TianyanchaEnricher
 from enrichers.website import WebsiteEnricher
 from exporters.excel import export_leads_to_excel
 from models import RawSupplierLead
-from utils.dedup import commit_lead_fingerprints
+from utils.dedup import commit_lead_fingerprints, rollback_fingerprints
 from utils.logger import get_logger
 
 logger = get_logger("pipeline")
@@ -26,8 +26,13 @@ logger = get_logger("pipeline")
 # aiqicha    : 爱企查（默认）
 # tianyancha : 天眼查（改动前的行为，保留可切回）
 # both       : 双源漏斗——先爱企查，关键字段仍缺失的再用天眼查兜底
-ENRICH_SOURCES = ("aiqicha", "tianyancha", "both")
-ENRICH_SOURCE_LABELS = {"aiqicha": "爱企查", "tianyancha": "天眼查", "both": "双源(爱企查→天眼查)"}
+ENRICH_SOURCES = ("aiqicha", "tianyancha", "both", "hybrid")
+ENRICH_SOURCE_LABELS = {
+    "aiqicha": "爱企查",
+    "tianyancha": "天眼查",
+    "both": "双源(爱企查→天眼查兜底)",
+    "hybrid": "双源(天眼查/爱企查 按家轮流)",
+}
 
 # —— 验证码策略 ——
 # auto   : 先尝试打码平台自动识别（需在 .env 配凭据），失败再人工等待
@@ -110,11 +115,30 @@ def _record_key(store_url: str, company: str = "") -> str:
 #   ① 环球资源没爬到中文名 → 同轮内立即重爬一次（crawler 内部已做）；
 #   ② 重爬仍无 → 不入库 / 删除；
 #   ③ **只认环球资源**——爱企查或大模型补到中文名不算"有"，不阻止删除；
-#   ④ 指纹库**只在成功入库后**才写（见 `utils.dedup.commit_lead_fingerprints`）。
-#      所以被这里剔除的家**不会**进指纹库 ⇒ 下一轮还会被重新采到、再给一次机会。
-#      有意如此：宁可多花几次详情请求，也不要"一次没爬到就永久丢掉这家"。
+#   ④ 指纹库**候选即写、剔除时回滚**（2026-09-17 用户口径，早上那版是"入库后才写"）：
+#      采集端 `dedup.add()` 在候选被接受时就登记（同一轮/后续批次不再重复采到同一家，
+#      省掉白跑的详情 + 独立站 + 两家补全）；
+#      这里剔除时调 `rollback_fingerprints()` 撤掉 ⇒ 下一轮还能重新采到、再给一次机会。
+#      两条合起来 = 「不再白采」+「不永久丢掉」，比只写一端更好。
 def _has_chinese(text: str) -> bool:
     return bool(re.search(r'[\u4e00-\u9fa5]', text or ""))
+
+
+def _rollback_dropped_fingerprints(leads: list) -> int:
+    """剔除时撤销指纹，返回撤掉的条数。
+
+    ⚠️ 英文名和中文工商名**两个写法都要撤**：候选阶段写的是英文名，
+    详情阶段还会补一条中文名；只撤一个会留下半个黑洞。
+
+    撤不掉的（本来就没写进去）会静默跳过 —— `remove_many` 只删命中的。
+    """
+    names: list[str] = []
+    for ld in leads:
+        for attr in ("company", "registered_company"):
+            v = str(getattr(ld, attr, "") or "").strip()
+            if v:
+                names.append(v)
+    return rollback_fingerprints(names) if names else 0
 
 
 # —— 工商字段的"伪值"归一 ——
@@ -450,6 +474,15 @@ def _classify_result(info: dict, raised: bool) -> str:
     return "not_found"
 
 
+def _split_alternating(items: list) -> tuple[list, list]:
+    """按家**交替**把列表分成两份：偶数下标 → A，奇数下标 → B。
+
+    30 家 → (15, 15)；27 家 → (14, 13)。用交替而不是切片，是为了避免
+    "GS 列表前排的商户更活跃"导致两家拿到的样本不等价。
+    """
+    return list(items[0::2]), list(items[1::2])
+
+
 async def _enrich_business(
     needing: list,
     source: str,
@@ -483,12 +516,27 @@ async def _enrich_business(
     elif source == "both":
         passes.append(("aiqicha", needing))
         passes.append(("tianyancha", None))  # None = 动态取“仍缺失”的子集
+    elif source == "hybrid":
+        # 按家**交替**分派：第 1 家→天眼查，第 2 家→爱企查，第 3 家→天眼查…
+        # 为什么交替而不是"前后各半"：GS 列表页前排的商户通常更活跃，前后切开会让
+        # 两家拿到的样本不等价；交替则最均衡。
+        # 天眼查那批先跑（用户口径），两家**串行**：它们共用同一个 CDP 浏览器，
+        # 天眼查命中验证码时要 bring_to_front 抢焦点，并行会互相打断验证码流程。
+        tyc_recs, aiqc_recs = _split_alternating(needing)
+        passes.append(("tianyancha", tyc_recs))
+        passes.append(("aiqicha", aiqc_recs))
+        logger.info(f"      🔀 [分流] 本批 {len(needing)} 家按家交替分配："
+                    f"天眼查 {len(tyc_recs)} 家 → 爱企查 {len(aiqc_recs)} 家（串行执行）")
     else:  # 默认 aiqicha
         passes.append(("aiqicha", needing))
 
     for name, recs in passes:
         if stats["aborted"]:
             break
+
+        if recs is not None and not recs:
+            logger.info(f"      ↩️ [分流] {ENRICH_SOURCE_LABELS.get(name, name)} 本次没有分到商户，跳过")
+            continue
 
         if recs is None:
             recs = [r for r in needing if _missing_business_keys(r)]
@@ -558,54 +606,27 @@ async def _enrich_business(
     return stats
 
 
-async def run_pipeline(
-    keyword: str = "monitor",
-    platform: str = "globalsources",
-    max_count: int = 5,
-    output_file: str = "suppliers_leads.xlsx",
-    enrich_websites: bool = True,
-    enrich_tianyancha: bool = True,
-    enrich_source: str = "tianyancha",
-    resume: bool = True,
-    captcha_mode: str = "auto",
-    captcha_provider: str | None = None,
-    captcha_wait: float | None = None,
-    drop_missing_name: bool = True,
-):
-    source = (enrich_source or "tianyancha").strip().lower()
-    if source not in ENRICH_SOURCES:
-        logger.warning(f"⚠️ [Pipeline] 未知数据源 {enrich_source!r}，回退为 tianyancha（可选: {', '.join(ENRICH_SOURCES)}）")
-        source = "tianyancha"
+async def _prepare_batch(
+    crawler,
+    *,
+    keyword: str,
+    scrape_count: int,
+    enrich_websites: bool,
+    drop_missing_name: bool,
+    batch_no: int,
+) -> dict:
+    """**轻活**：采集 → 无中文名剔除 → 独立站探测 → LLM 质检。返回 `records`。
 
-    mode = (captcha_mode or "auto").strip().lower()
-    if mode not in CAPTCHA_MODES:
-        logger.warning(f"⚠️ [Pipeline] 未知验证码模式 {captcha_mode!r}，回退为 auto（可选: {', '.join(CAPTCHA_MODES)}）")
-        mode = "auto"
+    这一段之所以能单独切出来做「预取」：它几乎不占用补全那条链路 ——
+    GS 采集走**自己新建的标签页**（`crawler.scrape`），独立站是 httpx，LLM 是外部 API。
+    而两家工商补全（重活）主要时间花在浏览器里的等待（每家族 3~6s 冷却 +
+    每 17~20 家 45~60s 大休眠 + 验证码），那期间浏览器基本是**空转**的，
+    正好用来把下一批的轻活跑掉 —— 这就是「异步预取」的全部收益来源。
 
-    logger.info("=======================================================")
-    logger.info("🚀 [Pipeline] 启动自动化多平台采集流水线")
-    logger.info(f"🌐 目标平台: {platform} | 关键词: {keyword} | 本次计划采集: {max_count}")
-    logger.info(f"🧩 工商补全数据源: {ENRICH_SOURCE_LABELS[source]}"
-                f"{'（已关闭，--no-enrich）' if not enrich_tianyancha else ''}")
-    wait_secs = max(0.0, captcha_wait if captcha_wait is not None else config.CAPTCHA_WAIT_SECONDS)
-    if source == "tianyancha":
-        # 天眼查是**两段式点选**验证码（先点按钮 → 再按箭头提示顺序点图形），
-        # 走云码的人工点选接口 type=30009（约 0.025 元/次，比旋转类型贵，且不报错退费）。
-        logger.info(f"🔐 验证码策略: {CAPTCHA_MODE_LABELS[mode]}（人工等待上限 {wait_secs:.0f}s）"
-                    f"｜天眼查为两段式**点选**，需云码 type={config.YUNMA_POINT_TYPE}；"
-                    f"另有每 17~20 家 45~60s 大休眠")
-        logger.info(f"   {config.captcha_status()}")
-    else:
-        logger.info(f"🔐 验证码策略: {CAPTCHA_MODE_LABELS[mode]}（人工等待 {wait_secs:.0f}s） | {config.captcha_status()}")
-    logger.info(f"💾 断点续采: {'开' if resume else '关'} | 输出: {output_file}")
-    logger.info("=======================================================")
-
-    logger.info(f"🧹 入库门槛: " + (
-        "要求「GS 有中文工商名」且「工商库能查到信息」，不满足即剔除"
-        if drop_missing_name else "不设门槛，全部入库（--keep-missing-name）"))
-
-    crawler = CrawlerFactory.get_crawler(platform)
-    fresh_leads: list[RawSupplierLead] = await crawler.scrape(keyword=keyword, max_count=max_count)
+    `scrape_count` 是**本批的采集上限**，不一定是 `--batch-size`：
+    末批只差几家时上游会传差额（避免整批采满导致超采，实测目标 60 结果入了 84）。
+    """
+    fresh_leads: list[RawSupplierLead] = await crawler.scrape(keyword=keyword, max_count=scrape_count)
 
     # 1.5 「环球资源没爬到中文名 → 重爬一次 → 仍无则剔除」
     # crawler 内部已经同轮重试过一次（含冷却），到这里仍没有中文名的就是确认取不到的。
@@ -622,9 +643,10 @@ async def run_pipeline(
             name = (ld.registered_company or "").strip()
             (kept if _has_chinese(name) else dropped).append(ld)
         if dropped:
+            rolled = _rollback_dropped_fingerprints(dropped)
             logger.info(f"\n🧹 [入库前过滤] {len(dropped)} 家没有中文工商名，本次不入库"
-                        f"（未登记指纹 ⇒ 下一轮还会重新采到、再试一次；"
-                        f"想留着这些行入库请加 --keep-missing-name）")
+                        f"；已撤销其指纹 {rolled} 条 ⇒ 下一轮还会重新采到、再试一次"
+                        f"（想留着这些行入库请加 --keep-missing-name）")
             for ld in dropped:
                 raw = (ld.registered_company or "").strip()
                 why = f"GS 只给了英文名 {raw!r}（多为香港/离岸主体）" if raw else "GS 未爬到工商名"
@@ -683,6 +705,30 @@ async def run_pipeline(
         rec["eval"] = eval_res.model_dump()
         rec["llm_evaluated"] = True
 
+    return records
+
+
+async def _finish_batch(
+    crawler,
+    records: dict,
+    *,
+    keyword: str,
+    output_file: str,
+    enrich_tianyancha: bool,
+    source: str,
+    mode: str,
+    captcha_provider: str | None,
+    captcha_wait: float | None,
+    drop_missing_name: bool,
+    batch_no: int,
+) -> int:
+    """**重活**：两家工商补全 → 工商全空剔除 → 存量复核 → 落盘 → 兜底写指纹。
+
+    返回本批**真正新增**的入库家数（由导出器回填，不是 `len(leads_data)`）。
+
+    慢在浏览器等待上（每家族 3~6s 冷却 / 每 17~20 家 45~60s 大休眠 / 验证码），
+    所以调用方会在这段时间里**并行预取下一批的轻活**（见 `_prepare_batch`）。
+    """
     # 4. 工商数据补全（默认爱企查；可切天眼查 / 双源）
     if enrich_tianyancha:
         needing = []
@@ -755,8 +801,10 @@ async def run_pipeline(
             else:
                 kept[key] = rec
         if dropped:
+            rolled = _rollback_dropped_fingerprints([RawSupplierLead(**r["lead"]) for r in dropped])
             logger.info(f"\n🧹 [入库前过滤] {len(dropped)} 家在工商库中查不到任何信息"
-                        f"（注册资本/实缴/参保/经营状态/联系人/电话 全空），本次不入库")
+                        f"（注册资本/实缴/参保/经营状态/联系人/电话 全空），本次不入库"
+                        f"；已撤销其指纹 {rolled} 条 ⇒ 下一轮还会重新采到、再试一次")
             for rec in dropped:
                 ld = RawSupplierLead(**rec["lead"])
                 logger.info(f"      ✗ 剔除: {ld.company} | {ld.store_url}"
@@ -767,8 +815,10 @@ async def run_pipeline(
         records = kept
 
     # 5. 存量报表里「无中文名」的历史行：重爬一次，仍取不到则删除
+    # ⚠️ 只在**第 1 批**做：它是"全量扫报表 + 逐条重抓"，分批跑多次等于把同一批历史行
+    #    白抓多遍（清理不掉的会一直留在表里，每批都被重新抓到）。
     drop_urls: set[str] = set()
-    if drop_missing_name:
+    if drop_missing_name and batch_no == 1:
         drop_urls = await _recheck_legacy_missing_name(crawler, output_file)
 
     # 6. 落盘报表导出
@@ -778,26 +828,318 @@ async def run_pipeline(
         EvaluatedSupplier(**rec["eval"]) if rec.get("eval") else _default_eval(RawSupplierLead(**rec["lead"]))
         for rec in records.values()
     ]
-    export_leads_to_excel(
-        leads_data=leads_data,
-        enriched_results=enriched_results,
-        eval_results=eval_results,
-        keyword=keyword,
-        output_file=output_file,
-        drop_urls=drop_urls,
-    )
+    if not leads_data and not drop_urls:
+        # 本批没有可入库的新行、也没有存量要删 —— 跳过写表（避免无意义的读+写 xlsx，
+        # 也避免报表被 Excel 占用时白白报一次 PermissionError）。
+        logger.info("      ⏭️ 本批既无新行入库、也无存量要删，跳过写表")
+        return 0
 
-    # 7. 落盘**成功之后**才写指纹库。
-    # 位置刻意放在 export 之后而不是采集阶段：指纹库的语义是「这家已经进了报表」，
-    # 早写会让「采到 → 被剔除 → 指纹已写 → 永久消失」成立（实测 3218 条指纹只对应
-    # 286 行报表）。放这里还有两个好处：
-    #   · 导出抛异常 ⇒ 指纹不写 ⇒ 这批下轮还能重来；
-    #   · 中途 Ctrl-C ⇒ 同理，不会留下"没入库却被标记已处理"的孤儿。
-    # 注意这里用的是 `leads_data`（= records，已剔除无中文名/工商全空的家），
-    # 所以写进去的都是**确实进过报表**的公司。
+    export_stats: dict = {}
+    try:
+        export_leads_to_excel(
+            leads_data=leads_data,
+            enriched_results=enriched_results,
+            eval_results=eval_results,
+            keyword=keyword,
+            output_file=output_file,
+            drop_urls=drop_urls,
+            stats=export_stats,
+        )
+    except Exception as e:
+        # ⚠️ 「候选即写」带来的新风险：指纹已经在采集阶段写下了，但报表**没落盘** ⇒
+        #    这批等于"处理过却没进报表"。必须把指纹撤掉，否则下次（以及以后每次）
+        #    都会被 `is_seen()` 跳过 —— 数据就白丢了。
+        #    最常见的触发场景：报表正被 Excel 打开（`~$` 锁文件）导致写盘失败。
+        rolled = _rollback_dropped_fingerprints(leads_data)
+        logger.error(
+            f"❌ [落盘失败] {type(e).__name__}: {e}\n"
+            f"   已回滚本批 {len(leads_data)} 家的指纹（{rolled} 条）⇒ 报表修好后重跑还能采到它们"
+        )
+        raise
+
+    # 7. 兜底确认指纹库。
+    # 主路径已改成「候选即写（采集端 `dedup.add`）+ 剔除时回滚（上面的
+    # `_rollback_dropped_fingerprints`）」，所以走到这里时，入库的家**基本都已在库里**，
+    # 这一步只作兜底：无论哪条采集路径、中间被谁改过逻辑，
+    # "进了报表的公司一定在指纹库里" 这件事都要成立。重复写法因哈希重复，返回 0。
     written = commit_lead_fingerprints(leads_data)
-    logger.info(f"🔑 [指纹库] 已为本次入库的 {len(leads_data)} 家商户登记指纹"
-                f"（新增 {written} 条；重复写法不会重复计）")
+    logger.info(f"🔑 [指纹库] 兜底确认：本批入库的 {len(leads_data)} 家都已在指纹库中"
+                f"（本次新增 {written} 条 —— 候选阶段已写过，正常应为 0；"
+                f"被剔除的家已在上面回滚）")
+
+    # 返回**真正新增**的家数（导出器回填）；分批循环用它累加进度
+    return int(export_stats.get("added", 0))
+
+
+async def run_pipeline(
+    keyword: str = "monitor",
+    platform: str = "globalsources",
+    max_count: int = 5,
+    output_file: str = "suppliers_leads.xlsx",
+    enrich_websites: bool = True,
+    enrich_tianyancha: bool = True,
+    enrich_source: str = "tianyancha",
+    resume: bool = True,
+    captcha_mode: str = "auto",
+    captcha_provider: str | None = None,
+    captcha_wait: float | None = None,
+    drop_missing_name: bool = True,
+    batch_size: int = 30,
+    reset_pages: bool = False,
+    async_prefetch: bool = True,
+):
+    """分批采集 → 批内分流两家 → 每批入库，直到**累计入库**达到目标。
+
+    用户口径（2026-09-17）：
+        「搜索 120 个，环球资源先搜索 30 个，然后把 15 个分给天眼查、15 个分给爱企查，
+          查完入库，然后接着如此，一直到查完为止」
+        → `-n 120 --batch-size 30 --enrich-source hybrid`
+
+    ⚠️ `max_count` 是**最终入库的目标家数**，不是 GS 采集数。每批都会剔除
+    「无中文工商名」「工商库查空」的家，所以 `采集数 ≠ 入库数`；按采集数计会在剔除率
+    高时提前收工、达不到目标。
+
+    ⚠️ 被剔除的家**不进指纹库**（用户口径：只对成功入库的写指纹），所以下一批会把它们
+    重新采到、再占一次名额。为此设了「连续 2 批零新增就停」的兜底，避免空转。
+
+    分批的额外好处：每批查完立刻入库 + 写指纹，中断时前面的批次成果不会丢。
+    """
+    total_count = max(1, int(max_count or 1))
+    batch_size = max(1, int(batch_size or 1))
+    plan_batches = (total_count + batch_size - 1) // batch_size
+
+    source = (enrich_source or "tianyancha").strip().lower()
+    if source not in ENRICH_SOURCES:
+        logger.warning(f"⚠️ [Pipeline] 未知数据源 {enrich_source!r}，回退为 tianyancha（可选: {', '.join(ENRICH_SOURCES)}）")
+        source = "tianyancha"
+
+    mode = (captcha_mode or "auto").strip().lower()
+    if mode not in CAPTCHA_MODES:
+        logger.warning(f"⚠️ [Pipeline] 未知验证码模式 {captcha_mode!r}，回退为 auto（可选: {', '.join(CAPTCHA_MODES)}）")
+        mode = "auto"
+
+    logger.info("=======================================================")
+    logger.info("🚀 [Pipeline] 启动自动化多平台采集流水线（分批模式）")
+    logger.info(f"🌐 目标平台: {platform} | 关键词: {keyword}")
+    logger.info(f"🎯 采集计划: 最终入库 {total_count} 家｜每批采集 {batch_size} 家｜"
+                f"预计 {plan_batches} 批（不足则自动补批）")
+    logger.info(f"🧩 工商补全数据源: {ENRICH_SOURCE_LABELS[source]}"
+                f"{'（已关闭，--no-enrich）' if not enrich_tianyancha else ''}")
+    if source == "hybrid":
+        logger.info(f"      🔀 分流口径: 每批按家**交替**分配（第1家→天眼查，第2家→爱企查，…），"
+                    f"两家**串行**执行（共用同一个浏览器，并行会互相打断验证码）")
+    elif source in ("tianyancha", "aiqicha"):
+        # 显式提示：否则"没分流"只体现在上面那一行数据源名里，很容易被忽略
+        # （实测踩到：入口脚本忘了传 enrich_source，26 家全给了天眼查没人发现）
+        logger.info(f"      ℹ️ 当前是**单数据源、不分流**（全部交给{ENRICH_SOURCE_LABELS[source]}）。"
+                    f"要「天眼查 / 爱企查 各分一半」请设 enrich_source='hybrid'"
+                    f"（CLI：--enrich-source hybrid）")
+    wait_secs = max(0.0, captcha_wait if captcha_wait is not None else config.CAPTCHA_WAIT_SECONDS)
+    if source == "tianyancha":
+        # 天眼查是**两段式点选**验证码（先点按钮 → 再按箭头提示顺序点图形），
+        # 走云码的人工点选接口 type=30009（约 0.025 元/次，比旋转类型贵，且不报错退费）。
+        logger.info(f"🔐 验证码策略: {CAPTCHA_MODE_LABELS[mode]}（人工等待上限 {wait_secs:.0f}s）"
+                    f"｜天眼查为两段式**点选**，需云码 type={config.YUNMA_POINT_TYPE}；"
+                    f"另有每 17~20 家 45~60s 大休眠")
+        logger.info(f"   {config.captcha_status()}")
+    else:
+        logger.info(f"🔐 验证码策略: {CAPTCHA_MODE_LABELS[mode]}（人工等待 {wait_secs:.0f}s） | {config.captcha_status()}")
+    logger.info(f"💾 断点续采: {'开' if resume else '关'} | 输出: {output_file}")
+    logger.info(f"⚡ 异步预取: {'开（下一批的采集/独立站/LLM 与本批工商补全并行）' if async_prefetch else '关（严格串行）'}")
+    logger.info("=======================================================")
+
+    logger.info(f"🧹 入库门槛: " + (
+        "要求「GS 有中文工商名」且「工商库能查到信息」，不满足即剔除"
+        if drop_missing_name else "不设门槛，全部入库（--keep-missing-name）"))
+
+    crawler = CrawlerFactory.get_crawler(platform)
+    if reset_pages and hasattr(crawler, "reset_page_cursor"):
+        cleared = crawler.reset_page_cursor()
+        logger.info(f"📑 [翻页进度] 已按要求重置（清掉 {cleared} 条）→ 本批从第 1 页重新扫")
+    elif plan_batches > 1 and hasattr(crawler, "reset_page_cursor"):
+        logger.info("📑 翻页进度在批次间**承接**：第 2 批起从上次停下的页继续，不重扫前面的页。"
+                    "代价：靠前页上被剔除的家不再重试（要重扫加 --reset-pages）")
+
+    ingested = 0
+    batch_no = 0
+    empty_streak = 0
+    scraped_total = 0   # 各批采集上限之和（用于收尾统计，避免再用 batch_no × batch_size 估算）
+    # 兜底上限：正常只需 plan_batches 批，留 3 倍余量应对"剔除太多需要补批"。
+    # 没有这个上限，"连续零新增但每批都采到几家又被全剔"会变成无限循环。
+    max_batches = plan_batches * 3 + 3
+
+    # 预取：`pending` 存"轻活已备好、还没做工商补全"的下一批
+    pending = None                 # (records, scrape_count, batch_no)
+    prefetch: asyncio.Task | None = None
+    prefetch_take = 0
+    prefetch_no = 0
+
+    while ingested < total_count and batch_no < max_batches:
+        batch_no += 1
+        remaining = total_count - ingested
+        # —— 末批按差额收口 ——
+        # 实测（2026-09-17）：目标 60，批 1 入 26、批 2 入 28（累计 54），
+        # 批 3 明明只差 6 家却整批采了 30 → **最终入库 84，超采 24 家**。
+        # 所以当差额小于一个批次时，只采差额。
+        # 代价：这批若又被剔除几家，可能还要再开一个小批次补（每个小批次约 3s 翻页 +
+        # 十几秒详情）—— 比超采 24 家划算得多。
+        take = min(batch_size, remaining)
+        last_gap = take < batch_size
+        logger.info("")
+        logger.info("─" * 62)
+        logger.info(f"📦 [批次 {batch_no}/{plan_batches}] 累计入库 {ingested}/{total_count}"
+                    f"｜本批采集上限 {take} 家"
+                    f"{'（**末批只补差额**，避免超采）' if last_gap else ''}"
+                    f"｜还差 {remaining} 家")
+        if async_prefetch and pending is None and prefetch is None:
+            logger.info("      ⚡ 本批工商补全期间会**并行预取**下一批的「采集 + 独立站 + LLM」"
+                        "（各自独立标签页；补全大半时间在冷却等待，浏览器是空转的）")
+            logger.info("         ↳ 期间两边的日志会**交错**，属正常现象")
+        logger.info("─" * 62)
+
+        # ① 本批 records：优先用上一批补全期间预取好的
+        if pending is not None:
+            records, prefetched_n, _pn = pending
+            pending = None
+            logger.info("      ♻️ 使用预取结果 —— 本批无需再等「采集 / 独立站 / LLM」")
+            # ⚠️ 这里**不能**把 `take` 换成预取时的数量！
+            # 预取时算 `prefetch_take` 用的 `ingested` 是**旧的**（那一刻本批还没入库），
+            # 所以它可能比本批实际需要的 `take` 大。不截断的话「末批只补差额」就白做了：
+            #   批 4 开始还差 41 家 → 预取 30 家；
+            #   批 4 实际只入 26 家，累计 105/120 → 末批只需 15 家，
+            #   却把预取来的 30 家全吃下去 → **又超采 15 家**（表头还写着"上限 15 家"）。
+            # 多出来的必须退还：它们没进报表，指纹也要撤掉，否则下轮会被 is_seen() 跳过。
+            if len(records) > take:
+                extra_keys = list(records.keys())[take:]
+                extra = [records.pop(k) for k in extra_keys]
+                rolled = _rollback_dropped_fingerprints(
+                    [RawSupplierLead(**r["lead"]) for r in extra])
+                scraped_total -= len(extra)
+                logger.info(f"      ✂️ 预取 {prefetched_n} 家 > 本批需要 {take} 家，"
+                            f"退还 {len(extra)} 家（已撤销指纹 {rolled} 条 ⇒ 下一轮还能重新采到）")
+        else:
+            records = await _prepare_batch(
+                crawler,
+                keyword=keyword,
+                scrape_count=take,
+                enrich_websites=enrich_websites,
+                drop_missing_name=drop_missing_name,
+                batch_no=batch_no,
+            )
+            scraped_total += take
+
+        # ② 挂起下一批的轻活 —— **真正的异步发生在这里**：
+        #    它和下面的 `_finish_batch`（两家补全，最慢的一段）并行跑。
+        #
+        # 只在**确实还需要**下一批时才预取，两个条件都是为了避免白预取：
+        #   · `ingested + take >= total_count`：本批若能达标（乐观上界），就不再预取 ——
+        #     否则最后一批永远会多备一批，白跑采集+质检，还得回滚指纹；
+        #   · `empty_streak == 0`：上一批零新增，说明正在熔断边缘，别浪费一次采集。
+        if (async_prefetch and empty_streak == 0
+                and (ingested + take) < total_count and batch_no + 1 <= max_batches):
+            prefetch_take = min(batch_size, total_count - ingested)
+            prefetch_no = batch_no + 1
+            prefetch = asyncio.create_task(_prepare_batch(
+                crawler,
+                keyword=keyword,
+                scrape_count=prefetch_take,
+                enrich_websites=enrich_websites,
+                drop_missing_name=drop_missing_name,
+                batch_no=prefetch_no,
+            ))
+            scraped_total += prefetch_take
+            logger.info(f"      ⚡ [预取] 第 {prefetch_no} 批的轻活已挂后台（上限 {prefetch_take} 家）")
+
+        # ③ 重活：两家补全 → 剔除 → 落盘 → 写指纹
+        added = await _finish_batch(
+            crawler,
+            records,
+            keyword=keyword,
+            output_file=output_file,
+            enrich_tianyancha=enrich_tianyancha,
+            source=source,
+            mode=mode,
+            captcha_provider=captcha_provider,
+            captcha_wait=captcha_wait,
+            drop_missing_name=drop_missing_name,
+            batch_no=batch_no,
+        )
+        ingested += added
+        logger.info(f"📦 [批次 {batch_no}] 结束：本批真正新增入库 {added} 家，累计 {ingested}/{total_count}")
+
+        # ④ 收预取结果。补全期间它已在并行跑，这里最多等它的尾巴。
+        if prefetch is not None:
+            try:
+                records_next = await prefetch
+                if ingested >= total_count:
+                    # 目标已达成 → 这批预取用不上了。**必须回滚它的候选指纹**：
+                    # 候选阶段已写进指纹库，不撤的话这些家下次会被 `is_seen()` 跳过 ——
+                    # "采集了却没进报表"，等于白丢（这正是今天改成"候选即写"后要注意的）。
+                    rolled = _rollback_dropped_fingerprints(
+                        [RawSupplierLead(**r["lead"]) for r in records_next.values()])
+                    # 挂预取时就把 prefetch_take 计进了 scraped_total，这里要扣回来：
+                    # 否则收尾那句"各批采集上限合计 N 家候选"会把**没真正用过**的批次算进去，
+                    # 看起来像超采（用户就是靠这个数字判断有没有多采的）。
+                    scraped_total -= prefetch_take
+                    logger.info(f"      🧹 目标已达成，丢弃预取的第 {prefetch_no} 批"
+                                f"（{len(records_next)} 家）；已回滚其指纹 {rolled} 条"
+                                f" ⇒ 下次（或 --reset-pages 后）还能采到它们")
+                else:
+                    pending = (records_next, prefetch_take, prefetch_no)
+            except Exception as e:
+                logger.warning(f"      ⚠️ 预取第 {prefetch_no} 批失败"
+                               f"（{type(e).__name__}: {e}）→ 下一批改为按部就班执行")
+                pending = None
+            finally:
+                prefetch = None
+                prefetch_take = 0
+
+        if added <= 0:
+            empty_streak += 1
+            if empty_streak >= 2:
+                logger.warning(
+                    f"\n⛔ [Pipeline] 连续 {empty_streak} 批零新增，停止补批。\n"
+                    f"   最可能的原因：候选池里剩下的都是「已在报表里」或「采到就被剔除」的家"
+                    f"（被剔除的家进了指纹库又回滚，会被反复采到）。\n"
+                    f"   可尝试：换关键词 / 换地区 / 查看是不是两家都在触发验证码。"
+                )
+                break
+        else:
+            empty_streak = 0
+        if ingested < total_count and batch_no < max_batches:
+            logger.info(f"   ↻ 未达目标，继续下一批 ...")
+
+    # —— 循环退出时的收尾：把"备好了但没用上"的批次**已登记的候选指纹撤掉** ——
+    # 候选阶段就写指纹了（见 crawlers/globalsources.py 的 `dedup.add`），不撤的话这些家
+    # 下轮会被 `is_seen()` 跳过：「采集了却没进报表」= 白丢。这正是第 ③ 个坑要防的事，
+    # 但原来只覆盖了「目标达成」那一条路径 —— 循环因 `max_batches` 用尽而退出时同样会遗留。
+    if pending is not None:
+        records_left, n_left, no_left = pending
+        rolled = _rollback_dropped_fingerprints(
+            [RawSupplierLead(**r["lead"]) for r in records_left.values()])
+        scraped_total -= n_left   # 同理：只统计真正用上的批次
+        logger.info(f"      🧹 收尾：第 {no_left} 批已备好但未使用（{len(records_left)} 家），"
+                    f"已回滚其指纹 {rolled} 条 ⇒ 下一轮可重新采到")
+        pending = None
+
+    # 走到这里 prefetch 通常已是 None（正常路径上 step ④ 会把它 await 干净并置空）。
+    # 保留这个兜底只为防御异常路径：**cancel 会丢掉那批 records，故其候选指纹无法回滚**，
+    # 所以只告警不静默。
+    if prefetch is not None:
+        prefetch.cancel()
+        logger.warning(f"      ⚠️ 预取的第 {prefetch_no} 批被中止：该批已写入的候选指纹"
+                       f"**未回滚**，如需重新采到它们请删除 seen_hashes.txt")
+
+    logger.info("")
+    logger.info("=" * 62)
+    if ingested >= total_count:
+        logger.info(f"🏁 [Pipeline] 目标达成：累计入库 {ingested} 家（共 {batch_no} 批，"
+                    f"各批采集上限合计 {scraped_total} 家候选）")
+    else:
+        logger.info(f"🏁 [Pipeline] 提前结束：累计入库 {ingested}/{total_count} 家（共 {batch_no} 批，"
+                    f"各批采集上限合计 {scraped_total} 家候选）")
+    logger.info(f"💾 报表: {output_file}")
+    logger.info("=" * 62)
 
 
 if __name__ == "__main__":

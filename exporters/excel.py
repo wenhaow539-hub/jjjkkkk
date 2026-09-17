@@ -37,12 +37,16 @@ def export_leads_to_excel(
     keyword: str,
     output_file: str = "suppliers_leads.xlsx",
     drop_urls: set | None = None,
+    stats: dict | None = None,
 ) -> str:
     """导出报表。
 
     drop_urls：需要从**存量报表**里删除的「平台网址」集合（环球资源重爬后仍无中文名的行）。
     之所以要在这里删而不是上游剔除：这些是**历史遗留行**，本轮根本没采集到它们
     （指纹已在 seen_hashes.txt 里），只能靠主键从合并结果里摘掉。
+
+    stats：可选出参。回填 `stats["added"]` = **真正新增**的行数（平台网址不在旧表里的）。
+    分批循环要靠它累加进度 —— 不能用 `len(leads_data)`，那会把"表里已存在的行"也算进去。
     """
     print("\n📊 [数据整理与导出] 正在写入 Excel 报表...")
 
@@ -163,4 +167,9 @@ def export_leads_to_excel(
     print(f"📈 累计总商户: {len(final_df)} 条 (本次真正新增入库: {max(0, added_count)} 条)")
     if removed_count:
         print(f"🗑️ 已从存量报表删除 {removed_count} 条（环球资源重爬后仍无中文工商名）")
+    if isinstance(stats, dict):
+        # 供分批循环累加进度：必须是「真正新增」而不是 len(leads_data)
+        stats["added"] = max(0, added_count)
+        stats["removed"] = removed_count
+        stats["total_rows"] = len(final_df)
     return target_path

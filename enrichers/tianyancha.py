@@ -36,6 +36,15 @@ class TianyanchaEnricher:
     STAGE_WAIT_SECOND = 15.0   # 点完按钮后，等第二段点选弹窗
     START_BTN_WAIT = 12.0      # 等「开始验证」按钮本身
 
+    # 打码轮数。口径与爱企查的 `captcha_max_attempts=3` 一致：
+    # 验证失败后极验会**换一张新图 + 一组新提示**，所以要"取新图重来"，而不是同图重试。
+    # 实测（2026-09-17 17:2x）：提示条 3 个图标、云码只返回 2 个坐标 → 必失败；
+    # 而当时只要换图重来一次就能过（同一账号几分钟后弹的那次一次就过了）。
+    CAPTCHA_MAX_ROUNDS = 3
+    # 单轮点完之后等放行的秒数。**要短**：失败时极验 1~2s 就给结果，
+    # 等太久会拖慢换新图的节奏（原先写死 15s，一轮白等）。
+    ROUND_RELEASE_WAIT = 6.0
+
     def __init__(self, captcha_mode: str = "auto", captcha_provider: str | None = None,
                  captcha_wait: float | None = None):
         self.search_count = 0  # 累计检索总数
@@ -491,7 +500,17 @@ class TianyanchaEnricher:
             const el = cands[0].el;
             el.setAttribute('data-wb-captcha', '1');
             const r = el.getBoundingClientRect();
-            return { x: r.x, y: r.y, width: r.width, height: r.height, dpr: window.devicePixelRatio || 1 };
+            // 提示条里的图标个数 = **需要点击的次数**。
+            // 极验的提示是图标（↖ ↗ →）而不是文字，所以只能靠数图；拿它和打码平台返回的
+            // 点数对比，就能识别"漏点"（实测：提示 3 个、平台只返回 2 个 → 必失败）。
+            // 图标来自 static.geetest.com/.../icon_material/，按 src 关键字数最稳；
+            // 数不到就退回"提示条容器内的 img 数"，再不行就 0（0 = 不做校验，只记录）。
+            const bySrc = [...el.querySelectorAll('img')]
+                .filter(i => /icon_material/i.test(i.getAttribute('src') || '')).length;
+            const tips = el.querySelector('[class*="geetest_tips"]');
+            const hintIcons = bySrc || (tips ? tips.querySelectorAll('img').length : 0);
+            return { x: r.x, y: r.y, width: r.width, height: r.height,
+                     dpr: window.devicePixelRatio || 1, hint_icons: hintIcons };
         }
     """
 
@@ -672,11 +691,16 @@ class TianyanchaEnricher:
                 return ""
             await asyncio.sleep(0.4)
 
-    async def _dump_captcha_forensics(self, page, reason: str) -> str | None:
+    async def _dump_captcha_forensics(self, page, reason: str,
+                                      extra_png: bytes | None = None,
+                                      extra_name: str = "captcha.png") -> str | None:
         """自动过码失败时**保留现场**：整页截图 + 验证码相关 DOM 摘要。
 
         验证码不是想触发就能触发的（实测分别在第 7 轮、第 2 轮才中），
         靠"等下次复现再调选择器"效率极低。现场落盘后，事后照真实结构改代码即可。
+
+        `extra_png` 会额外落一份**裁好的验证码图**（也就是喂给打码平台的那张）——
+        失败时看这张图就能判断"是打码员漏点了，还是提示本来就只有 2 个"。
         """
         try:
             import datetime
@@ -690,6 +714,12 @@ class TianyanchaEnricher:
                 await page.screenshot(path=os.path.join(d, "page.png"))
             except Exception:
                 pass
+            if extra_png:
+                try:
+                    with open(os.path.join(d, extra_name), "wb") as f:
+                        f.write(extra_png)
+                except Exception:
+                    pass
             try:
                 info = await page.evaluate(self._GEETEST_SCAN_JS)
             except Exception as e:
@@ -818,76 +848,31 @@ class TianyanchaEnricher:
 
             await asyncio.sleep(random.uniform(0.6, 1.2))   # 等图形区渲染完
 
-            # ③ 定位弹窗（含提示栏 + 图片区）并截图
-            box = await page.evaluate(self._FIND_MODAL_JS)
-            if not box:
-                print("      ⚠️ [天眼查] 未能定位验证码弹窗（DOM 结构可能与预期不同），转人工")
-                return False
-
-            el = page.locator("[data-wb-captcha]").first
-            png = await el.screenshot()
-            size = self._png_size(png)
-            if not size:
-                print("      ⚠️ [天眼查] 截图异常（非 PNG），转人工")
-                return False
-            img_w, img_h = size
-            # 图片像素 → CSS 像素的换算比例（用真实图片宽高，不假设 dpr）
-            sx = box["width"] / float(img_w)
-            sy = box["height"] / float(img_h)
-            print(f"      🖼️ [天眼查] 验证码截图 {img_w}×{img_h}px → 页面 {box['width']:.0f}×{box['height']:.0f}px"
-                  f"（比例 {sx:.2f}）")
-
-            # ④ 交给打码平台
-            points = await solver.solve_points(png)
-            if not points:
-                return False
-            print(f"      🤖 [天眼查] 平台返回 {len(points)} 个坐标: "
-                  f"{', '.join(f'({x:.0f},{y:.0f})' for x, y in points)}")
-
-            # ⑤ 按顺序依次点击。
-            # 每一击都：曲线轨迹移动 → 到位小停顿 → 按下 → **停留** → 抬起；
-            # 落点 = 平台给的图形中心 + 二维正态偏移（见 _jitter）。
-            for i, (px, py) in enumerate(points, 1):
-                jx, jy = self._jitter()
-                cx = box["x"] + px * sx + jx
-                cy = box["y"] + py * sy + jy
-                await self._human_click(page, cx, cy)
-                # 点完一个到点下一个之间：真人要先看一眼再移过去，别太急
-                await asyncio.sleep(random.uniform(0.45, 1.30))
-                print(f"         ✔ 第 {i} 次点击 ({cx:.0f}, {cy:.0f})"
-                      f"{f'  偏移({jx:+.1f},{jy:+.1f})' if self.point_jitter_px > 0 else ''}")
-
-            # ⑥ 点确定（先在本弹窗内找，再退回整页找）—— 同样走拟人点击
-            # 点确定前先生理性地停顿一下（真人点完图形会看一眼再确认）
-            await asyncio.sleep(random.uniform(0.35, 0.90))
-            clicked = False
-            for sel in ("button:has-text('确定')", "text=确定", "button:has-text('确认')"):
-                try:
-                    loc = page.locator("[data-wb-captcha]").locator(sel).first
-                    if await loc.count():
-                        clicked = await self._human_click_locator(page, loc)
-                        break
-                except Exception:
-                    continue
-            if not clicked:
-                for sel in ("button:has-text('确定')", "text=确定"):
-                    try:
-                        loc = page.locator(sel).first
-                        if await loc.count():
-                            clicked = await self._human_click_locator(page, loc)
-                            break
-                    except Exception:
-                        continue
-            if not clicked:
-                print("      ⚠️ [天眼查] 没找到「确定」按钮，转人工")
-                return False
-
-            # ⑦ 等放行
-            for _ in range(15):
-                await asyncio.sleep(1.0)
+            # ③~⑦ 多轮尝试。**每轮都重新截图**：验证失败后极验会换一张新图和一组
+            # 新提示，拿旧图重算等于把同一个错误再做一遍。
+            # （原先只有一轮，失败即转人工 —— 实测踩到：提示 3 个图标、云码只返回 2 个点，
+            #   当轮必失败，而换图重来一次就过了。）
+            last_info: dict = {}
+            for rnd in range(1, self.CAPTCHA_MAX_ROUNDS + 1):
+                # 上一轮可能其实已放行，只是判定慢半拍
                 if not await self._captcha_present(page):
                     return True
-            print("      ⚠️ [天眼查] 点击后仍未放行（坐标可能不准）")
+                ok, info = await self._solve_point_round(page, solver, rnd, self.CAPTCHA_MAX_ROUNDS)
+                if ok:
+                    return True
+                last_info = info
+                if rnd < self.CAPTCHA_MAX_ROUNDS:
+                    print(f"      ↻ [天眼查] 第 {rnd} 轮未通过"
+                          f"（{info.get('reason') or '未放行'}），换新图重试")
+                    await self._reset_point_modal(page)
+                    await self._human_rest(1.2, 2.4, desc="换新图前停顿")
+
+            await self._dump_captcha_forensics(
+                page, f"point_failed_{last_info.get('reason') or 'unknown'}",
+                extra_png=last_info.get("png"), extra_name="last_round_captcha.png")
+            print(f"      ⚠️ [天眼查] {self.CAPTCHA_MAX_ROUNDS} 轮均未通过"
+                  f"（最后一轮：提示条 {last_info.get('hint_icons') or '?'} 个图标 / "
+                  f"平台返回 {last_info.get('points') or 0} 个点；现场已落盘）")
             return False
 
         except CaptchaProviderError as e:
@@ -896,6 +881,122 @@ class TianyanchaEnricher:
         except Exception as e:
             print(f"      ⚠️ [天眼查] 自动过码异常: {type(e).__name__}: {e}")
             return False
+
+    async def _solve_point_round(self, page, solver, rnd: int, total: int) -> tuple[bool, dict]:
+        """跑一轮：定位弹窗 → 截图 → 打码 → 依次点击 → 点确定 → 等放行。
+
+        返回 `(是否放行, 本轮信息)`。信息里带 `hint_icons`（提示条图标数 = **应点次数**）
+        与 `points`（平台返回点数），用来识别"漏点" —— 两者不等时基本必失败，
+        这种情况**直接换新图**，不浪费一次浏览器点击。
+        """
+        info: dict = {"round": rnd, "hint_icons": 0, "points": 0, "reason": "", "png": None}
+
+        # ③ 定位弹窗（含提示栏 + 图片区）并截图
+        box = await page.evaluate(self._FIND_MODAL_JS)
+        if not box:
+            info["reason"] = "no_modal"
+            print(f"      ⚠️ [天眼查] 第 {rnd}/{total} 轮：未能定位验证码弹窗")
+            return False, info
+        info["hint_icons"] = int(box.get("hint_icons") or 0)
+
+        el = page.locator("[data-wb-captcha]").first
+        png = await el.screenshot()
+        info["png"] = png
+        size = self._png_size(png)
+        if not size:
+            info["reason"] = "bad_screenshot"
+            print(f"      ⚠️ [天眼查] 第 {rnd}/{total} 轮：截图异常（非 PNG）")
+            return False, info
+        img_w, img_h = size
+        # 图片像素 → CSS 像素的换算比例（用真实图片宽高，不假设 dpr）
+        sx = box["width"] / float(img_w)
+        sy = box["height"] / float(img_h)
+        print(f"      🖼️ [天眼查] 第 {rnd}/{total} 轮截图 {img_w}×{img_h}px → 页面 "
+              f"{box['width']:.0f}×{box['height']:.0f}px（比例 {sx:.2f}）")
+
+        # ④ 交给打码平台
+        points = await solver.solve_points(png)
+        if not points:
+            info["reason"] = "no_points"
+            return False, info
+        info["points"] = len(points)
+        print(f"      🤖 [天眼查] 平台返回 {len(points)} 个坐标: "
+              f"{', '.join(f'({x:.0f},{y:.0f})' for x, y in points)}")
+        # 漏点检测（实测踩到的正是这条）：提示条 3 个图标、平台只给 2 个点 → 必失败
+        if info["hint_icons"] and len(points) != info["hint_icons"]:
+            info["reason"] = f"count_mismatch({info['hint_icons']}vs{len(points)})"
+            print(f"      ⚠️ [天眼查] **点数不符**：提示条 {info['hint_icons']} 个图标，"
+                  f"平台只返回 {len(points)} 个 → 判为漏识别，直接换新图")
+            return False, info
+
+        # ⑤ 按顺序依次点击。
+        # 每一击都：曲线轨迹移动 → 到位小停顿 → 按下 → **停留** → 抬起；
+        # 落点 = 平台给的图形中心 + 二维正态偏移（见 _jitter）。
+        for i, (px, py) in enumerate(points, 1):
+            jx, jy = self._jitter()
+            cx = box["x"] + px * sx + jx
+            cy = box["y"] + py * sy + jy
+            await self._human_click(page, cx, cy)
+            # 点完一个到点下一个之间：真人要先看一眼再移过去，别太急
+            await asyncio.sleep(random.uniform(0.45, 1.30))
+            print(f"         ✔ 第 {i} 次点击 ({cx:.0f}, {cy:.0f})"
+                  f"{f'  偏移({jx:+.1f},{jy:+.1f})' if self.point_jitter_px > 0 else ''}")
+
+        # ⑥ 点确定（先在本弹窗内找，再退回整页找）—— 同样走拟人点击
+        # 点确定前先生理性地停顿一下（真人点完图形会看一眼再确认）
+        await asyncio.sleep(random.uniform(0.35, 0.90))
+        clicked = False
+        for sel in ("button:has-text('确定')", "text=确定", "button:has-text('确认')"):
+            try:
+                loc = page.locator("[data-wb-captcha]").locator(sel).first
+                if await loc.count():
+                    clicked = await self._human_click_locator(page, loc)
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            for sel in ("button:has-text('确定')", "text=确定"):
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count():
+                        clicked = await self._human_click_locator(page, loc)
+                        break
+                except Exception:
+                    continue
+        if not clicked:
+            info["reason"] = "no_confirm_btn"
+            print("      ⚠️ [天眼查] 没找到「确定」按钮")
+            return False, info
+
+        # ⑦ 等放行。**短等**：失败时极验 1~2s 就出结果，等太久会拖慢换新图的节奏
+        # （原先写死 15s，一轮白等十几秒）。
+        waited = 0.0
+        while waited < self.ROUND_RELEASE_WAIT:
+            await asyncio.sleep(0.5)
+            waited += 0.5
+            if not await self._captcha_present(page):
+                return True, info
+        info["reason"] = "not_released"
+        print(f"      ⚠️ [天眼查] 第 {rnd}/{total} 轮点击后 {waited:.0f}s 未放行")
+        return False, info
+
+    async def _reset_point_modal(self, page) -> bool:
+        """换新图（best effort）。极验失败后通常会自己刷新，但有时要手动点刷新按钮。
+
+        返回是否点到了刷新按钮；没点到也不算失败 —— 调用方随后还会等一段。
+        """
+        for sel in ('[class*="geetest_refresh"]', '[class*="geetest_reset"]',
+                    '[class*="geetest_reload"]', 'button:has-text("刷新")',
+                    'button:has-text("换一张")', '[aria-label*="刷新"]'):
+            try:
+                loc = page.locator(sel).first
+                if await loc.count():
+                    if await self._human_click_locator(page, loc):
+                        print(f"      🔄 [天眼查] 已点刷新换新图（{sel}）")
+                        return True
+            except Exception:
+                continue
+        return False
 
     def _clean_capital(self, val: str) -> str:
         """金额提纯：提取规范金额及币种"""

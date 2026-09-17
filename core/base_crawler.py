@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 import asyncio
 import random
+import config
 from core.browser import ensure_chrome_running, is_port_open
 from models import RawSupplierLead
 from utils.ratelimit import AsyncRateLimiter
@@ -17,7 +18,15 @@ class BaseCrawler(ABC):
         # 说明：legacy 早期版本有这个限速器，重写时被漏掉了 —— 于是 concurrency=4、
         # 每个商户内部再并发抓 profile+contact，瞬时最多 8 个请求零间隔打向同一站点，
         # 会被限流/拒绝；而抓取失败又被静默吞掉，表现为"整列字段空白且看不出原因"。
-        self._rate_limiter = AsyncRateLimiter(min_interval=1.2, jitter=0.35)
+        #
+        # ⚠️ 这个限速器是**全局串行**的（单实例共享，`_next_slot` 累加），所以它才是详情阶段的
+        #    真正瓶颈：总耗时 ≈ 请求数 × min_interval。实测 12 请求 / 并发 4 → 12.6s，
+        #    均值 1.14s/请求 —— 调大 `concurrency` 对吞吐**毫无帮助**。
+        #    数值统一走 config（可用 .env 覆盖），默认 2026-09-17 由 1.2 下调到 0.9。
+        self._rate_limiter = AsyncRateLimiter(
+            min_interval=config.DETAIL_RATE_MIN_INTERVAL,
+            jitter=config.DETAIL_RATE_JITTER,
+        )
 
     def is_port_open(self, host: str = "127.0.0.1") -> bool:
         return is_port_open(host=host, port=self.cdp_port)

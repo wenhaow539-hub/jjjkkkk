@@ -82,7 +82,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--platform", default=None,
                         help=f"平台名（adapter 模式用于选适配器；--pipeline 模式用于选 legacy 爬虫）。默认 {DEFAULT_PLATFORM}")
     parser.add_argument("--keyword", default=DEFAULT_KEYWORD, help=f"检索关键词（默认 {DEFAULT_KEYWORD}）")
-    parser.add_argument("-n", "--limit", type=int, default=DEFAULT_LIMIT, help=f"采集上限（默认 {DEFAULT_LIMIT}）")
+    parser.add_argument("-n", "--limit", type=int, default=DEFAULT_LIMIT,
+                        help=f"--pipeline：**最终入库的目标家数**（默认 {DEFAULT_LIMIT}）。"
+                             f"注意不是 GS 采集数——每批剔除「无中文名/工商查空」的家，"
+                             f"所以实际采集量会多于这个数")
+    parser.add_argument("--batch-size", type=int, default=30,
+                        help="--pipeline：每批 GS 采集多少家（默认 30）。每批查完立即入库并写指纹，"
+                             "累计入库不足 -n 就自动补下一批")
+    parser.add_argument("--reset-pages", action="store_true",
+                        help="--pipeline：清掉跨批翻页进度，从第 1 页重新扫。"
+                             "默认会承接：第 2 批起从上次停下的页继续（省掉重扫前面几页的 2~3s/页）")
+    parser.add_argument("--no-async-prefetch", action="store_true",
+                        help="--pipeline：关掉「异步预取」（默认开）。开着时，本批的工商补全会"
+                             "与下一批的「GS 采集 + 独立站 + LLM」**并行**——补全大半时间在冷却等待，"
+                             "浏览器是空转的，正好用来备下一批。关掉则退回严格串行（更稳，但慢）")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help=f"--pipeline 模式的 Excel 输出（默认 {DEFAULT_OUTPUT}）")
     parser.add_argument("--excel", default=None, help="adapter 模式把线索导出到该 Excel 文件")
 
@@ -104,9 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
     # --pipeline 专用
     parser.add_argument("--no-enrich", action="store_true", help="--pipeline：跳过独立站探测与工商补全")
     parser.add_argument("--no-resume", action="store_true", help="--pipeline：不使用断点续采")
-    parser.add_argument("--enrich-source", choices=["aiqicha", "tianyancha", "both"], default="tianyancha",
+    parser.add_argument("--enrich-source", choices=["aiqicha", "tianyancha", "both", "hybrid"],
+                        default="tianyancha",
                         help="--pipeline：工商补全数据源（默认 tianyancha 天眼查；"
-                             "aiqicha=爱企查；both=爱企查优先+天眼查兜底）")
+                             "aiqicha=爱企查；both=爱企查优先+天眼查兜底；"
+                             "hybrid=**天眼查/爱企查按家轮流**，每批各分一半）")
     parser.add_argument("--captcha-mode", choices=["auto", "manual", "off"], default="auto",
                         help="--pipeline：验证码策略。auto=先自动打码（需 .env 配打码平台）失败转人工；"
                              "manual=仅人工等待（改动前行为）；off=无人值守，命中即跳过该家（默认 auto）")
@@ -219,8 +234,10 @@ async def run_adapter(args) -> int:
                 output_file=args.excel,
             )
 
-            # 落盘成功之后才写指纹库（adapter 的 `_emit_company` 已不再写）。
-            # 与 pipeline 路径保持同一口径：指纹 = 「已进报表」，不是「抓过详情」。
+            # ⚠️ adapter 路径（Crawlee，不走 pipeline）目前仍是「落盘后才写」——
+            # 它的候选阶段在 `adapters/globalsources.py` 里，没有配套的回滚点，
+            # 所以这里保留兜底写入。pipeline 路径（run_mvp / --pipeline）已是
+            # 「候选即写 + 剔除时回滚」。
             from utils.dedup import commit_lead_fingerprints
 
             written = commit_lead_fingerprints(leads)
@@ -256,6 +273,9 @@ async def run_pipeline_entry(args) -> int:
         captcha_provider=args.captcha_provider,
         captcha_wait=args.captcha_wait,   # None → 由 config.CAPTCHA_WAIT_SECONDS 决定
         drop_missing_name=not args.keep_missing_name,
+        batch_size=args.batch_size,
+        reset_pages=args.reset_pages,
+        async_prefetch=not args.no_async_prefetch,
     )
     return 0
 

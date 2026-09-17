@@ -204,9 +204,10 @@ class AiCaiGouCrawler(BaseCrawler):
                             continue
 
                         seen_companies.add(pure_comp)
-                        # ⚠️ 不在候选阶段写指纹库：这里只是"看到了这家"，
-                        # 离"进了报表"还差详情、独立站、工商补全等好几道门槛。
-                        # 统一由流水线在落盘成功后调用 `dedup.commit_lead_fingerprints()`。
+                        # 候选即写指纹（与 GlobalSources 同口径）。
+                        # 没入库的会被 pipeline 的 `rollback_fingerprints()` 撤掉，
+                        # 所以不会形成"采过却从未入库"的永久黑洞。
+                        dedup.add(pure_comp)
 
                         candidate_leads.append(RawSupplierLead(
                             company=pure_comp,

@@ -104,6 +104,25 @@ CAPTCHA_POINT_JITTER_PX = float(_first_env("CAPTCHA_POINT_JITTER_PX", default="3
 CAPTCHA_SQUARE_CROP = _first_env("CAPTCHA_SQUARE_CROP", default="auto").strip().lower() or "auto"
 
 
+# —— 详情页请求节奏（GS 等站的 HTTPX 抓取）——
+# ⚠️ 这是**全局限速器**：所有并发任务共享同一个实例，相邻请求的启动间隔 >= 本值 × (1±jitter)。
+#    所以它**直接决定**详情阶段的墙钟时间 ≈ 请求数 × 本值。
+#    实测（2026-09-17）：12 个请求、并发上限 4 → 耗时 12.6s（均值 1.14s/请求），**完全串行**。
+#    ⇒ 调大并发度没有意义（`Semaphore(4)` 只是让 4 个协程一起排队），只有这个值能改变速度。
+#    粗算：30 家 × 3~4 个请求 ≈ 90~120 次 → 0.9s 时约 1.4~1.8 分钟（1.2s 时是 1.8~2.4 分钟）。
+#    ⚠️ 不宜再往下压：一次 403/429 重试要花 3 个限速槽 + 4.5s 退避 ≈ 8s，被拒多了反而更慢。
+DETAIL_RATE_MIN_INTERVAL = float(_first_env("DETAIL_RATE_MIN_INTERVAL", default="0.9") or 0.9)
+DETAIL_RATE_JITTER = float(_first_env("DETAIL_RATE_JITTER", default="0.35") or 0.35)
+
+
+def detail_rate_status() -> str:
+    """详情页限速的一行摘要（启动横幅 / GS 详情阶段打印用）。"""
+    lo = DETAIL_RATE_MIN_INTERVAL * (1 - DETAIL_RATE_JITTER)
+    hi = DETAIL_RATE_MIN_INTERVAL * (1 + DETAIL_RATE_JITTER)
+    return (f"详情页限速 {lo:.2f}~{hi:.2f}s/请求（均值 {DETAIL_RATE_MIN_INTERVAL:.2f}s，"
+            f"全局限速器串行 → 并发度不改变总耗时）")
+
+
 def auto_captcha_provider() -> str:
     """决定实际生效的打码平台。
 

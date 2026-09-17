@@ -6,6 +6,7 @@ from urllib.parse import quote_plus, urljoin
 import httpx
 from playwright.async_api import async_playwright
 
+import config
 from core.base_crawler import BaseCrawler
 from core.factory import CrawlerFactory
 from models import RawSupplierLead
@@ -53,6 +54,60 @@ class GlobalSources(BaseCrawler):
         ".woff", ".woff2", ".ttf", ".eot", ".map", ".json", ".xml",
         ".php", ".asp", ".aspx", ".jsp", ".html", ".htm",
     )
+
+    # 搜索列表最多翻到第几页（原先是 scrape() 里的局部变量，提到类常量做单一出处）
+    MAX_SEARCH_PAGES = 25
+
+    # ---- 跨批翻页进度 ----
+    # 分批跑时每批都从 pageNum=1 重扫：已进指纹库的家会被 `dedup.is_seen` 跳过，
+    # 但**页面本身仍要重新加载 + 滚动 3 次**（每页约 2~3s），4 批下来纯属白烧。
+    # 记住页码后，第 2 批直接从上次停下的页继续。
+    #
+    # ⚠️ 代价（用户 2026-09-17 知情选择）：被剔除的家（无中文名 / 工商查空）**不进指纹库**，
+    #    而它们通常排在靠前的页 —— 跳过这些页就等于放弃了对它们的重试机会。
+    #
+    # ⚠️ 只在**进程内**记忆（实例属性），不落盘。跨运行"静默从中间开始采"很难解释，
+    #    真需要重扫全部时用 `--reset-pages`。
+    def __init__(self, cdp_port: int = 9222, concurrency: int = 4):
+        super().__init__(cdp_port=cdp_port, concurrency=concurrency)
+        self._page_cursor: dict[str, int] = {}
+
+    def _cursor_key(self, clean_kw: str, year_in_business: str, supplier_location: str) -> str:
+        """进度 key。带上 关键词/年限/地区 —— 换词或换地区不会串用别人的进度。"""
+        return (f"{self.platform_id}|{clean_kw}|"
+                f"{year_in_business or '-'}|{supplier_location or '-'}")
+
+    def _cursor_get(self, key: str) -> int:
+        """本批的起始页（1 = 从第一页开始）。"""
+        try:
+            return max(1, int(self._page_cursor.get(key, 1) or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    def _cursor_put(self, key: str, page_num: int) -> None:
+        """记录进度。
+
+        ⚠️ 传的是**当前页**，不是下一页。因为命中 max_count 时内层 `break`
+        （见 scrape 里 `if len(candidate_sellers) >= max_count: break`）会提前退出，
+        **本页并没被吃干净** —— 若记成下一页，本页剩余的候选就永久漏掉了。
+        所以下一批会重扫这一页：靠指纹去重跳掉已入库的，把剩下的接上。
+        """
+        try:
+            self._page_cursor[key] = min(max(1, int(page_num)), self.MAX_SEARCH_PAGES + 1)
+        except (TypeError, ValueError):
+            pass
+
+    def reset_page_cursor(self, keyword: str | None = None) -> int:
+        """清掉翻页进度。给了 keyword 就只清该关键词的。返回清掉的条数。"""
+        if not keyword:
+            n = len(self._page_cursor)
+            self._page_cursor.clear()
+            return n
+        kw = keyword.lower().replace("manufacturer", "").strip()
+        hit = [k for k in self._page_cursor if f"|{kw}|" in k]
+        for k in hit:
+            del self._page_cursor[k]
+        return len(hit)
 
     def _format_clean_url(self, href: str) -> str:
         if not href:
@@ -398,13 +453,33 @@ class GlobalSources(BaseCrawler):
             print(f"🔌 [{self.platform_name}] 接入 Chrome (CDP 端口: {self.cdp_port})...")
             browser = await p.chromium.connect_over_cdp(f"http://127.0.0.1:{self.cdp_port}")
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
-            page = context.pages[0] if context.pages else await context.new_page()
+
+            # ⚠️ **必须自建专用标签页，不能用 `context.pages[0]` 复用已有页面**：
+            #   ① 那个"第一个页面"可能是用户自己开着的标签页 —— 一次 goto 就把它导航走了；
+            #   ② 现在启用了「异步预取」：GS 采集与两家工商补全会**同时**跑，
+            #      补全用它自己的标签页。若采集去复用 pages[0]，两者会抢同一个 page，
+            #      互相导航/关页 → 直接崩。
+            # 自建页面不影响登录态（cookie 来自 context），代价只是多一个标签；
+            # 所以本批跑完要**关掉它**（见下面 unroute 之后），否则一批积一个标签。
+            page = await context.new_page()
 
             await page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
             await page.route("**/*", self.block_resources)
 
-            page_num = 1
-            max_search_pages = 25
+            # —— 承接上批的翻页进度 ——
+            ckey = self._cursor_key(clean_kw, year_in_business, supplier_location)
+            page_num = self._cursor_get(ckey)
+            max_search_pages = self.MAX_SEARCH_PAGES
+            if page_num > max_search_pages:
+                print(f"⚠️ [{self.platform_name}] 该关键词/地区下已翻到翻页上限"
+                      f"（第 {max_search_pages} 页），没有更多可扫的页 → 本批 0 家")
+                # ⚠️ 不在这里 `return []`：那会跳过下面的收尾（关标签页）。
+                # 把上界压到当前页之下，让 while 条件直接不成立，统一走收尾流程。
+                # 游标仍会被记成 MAX+1，下次进来还是走这个分支，行为不变。
+                max_search_pages = page_num - 1
+            if page_num > 1:
+                print(f"📑 [{self.platform_name}] 承接上批翻页进度：从第 {page_num} 页继续"
+                      f"（第 1~{page_num - 1} 页已扫过，不再重扫；要重扫请加 --reset-pages）")
 
             while len(candidate_sellers) < max_count and page_num <= max_search_pages:
                 query_parts = [
@@ -455,6 +530,12 @@ class GlobalSources(BaseCrawler):
 
                     if self.is_valid_company_name(comp_name) and comp_name not in seen_companies and href:
                         seen_companies.add(comp_name)
+                        # —— 候选即写指纹（2026-09-17 用户口径）——
+                        # 一进来就登记，同一轮/后续批次不会再采到同一家，
+                        # 省掉白跑的详情页 + 独立站 + 两家工商补全。
+                        # ⚠️ 配套回滚在 pipeline 侧：这家若最终因「无中文名 / 工商查空」
+                        #    没入库，会被 `rollback_fingerprints()` 撤掉，下次还能重试。
+                        dedup.add(comp_name)
 
                         card_data = await el.evaluate("""
                             (a) => {
@@ -493,6 +574,12 @@ class GlobalSources(BaseCrawler):
                     page_num += 1
                     await self.human_delay(1.5, 2.5, desc="翻页冷却")
 
+            # 记录翻页进度：`page_num` 停在「还没吃干净的那一页」
+            # （命中 max_count 时内层 break 提前退出，第 492 行的自增不会执行）
+            self._cursor_put(ckey, page_num)
+            print(f"📑 [{self.platform_name}] 翻页进度已记：下一批从第 "
+                  f"{self._cursor_get(ckey)} 页继续（本批结束于第 {page_num} 页）")
+
             # ⚠️ 必须按域名过滤：`context.cookies()` 不带参数会返回**浏览器里所有域**的 cookie。
             # 实测本机该浏览器累积了 276 条（globalsources / alibaba / aiqicha / tianyancha / baidu / qcc …），
             # 全部拼进 Cookie 头达 16KB，GS 直接返回 400 Request Header Or Cookie Too Large，
@@ -518,10 +605,22 @@ class GlobalSources(BaseCrawler):
             except Exception:
                 pass
 
+            # 关掉本批的专用标签页（见上面"必须自建"的说明）。
+            # 页面上的 cookie 这时已经读进 `session_cookies`，关掉不影响后面的 httpx 详情请求。
+            try:
+                await page.close()
+            except Exception:
+                pass
+
         if not candidate_sellers:
             return []
 
+        # 把限速参数一并打出来。这一阶段看起来"卡住"时，原因几乎总是**全局限速器串行**，
+        # 而不是"异步失效"（实测 12 请求 / 并发 4 → 12.6s，均值 1.14s/请求）。
         print(f"🚀 [{self.platform_name}] 启动 HTTPX 异步提取 {len(candidate_sellers)} 家商户工商与独立站...")
+        print(f"      ⏳ {config.detail_rate_status()}"
+              f"；每家约 3~4 个请求 → 本阶段预计 "
+              f"{len(candidate_sellers) * 3.5 * config.DETAIL_RATE_MIN_INTERVAL / 60:.1f} 分钟量级")
         semaphore = asyncio.Semaphore(self.concurrency)
         custom_headers = {
             "User-Agent": user_agent,
@@ -533,12 +632,12 @@ class GlobalSources(BaseCrawler):
             async def process_item(idx: int, s: dict):
                 async with semaphore:
                     detail = await self._parse_detail(client, s["store_url"])
-                    # ⚠️ 这里**不再**写指纹库。
-                    # 旧逻辑在"详情抓取成功"时就写，导致：采到 → 后续因缺中文名/工商库查不到
-                    # 被剔除 → 指纹却已写下 → 这家**永久消失**，以后每次搜索都被跳过。
-                    # 现在统一由流水线在**落盘成功之后**调用
-                    # `utils.dedup.commit_lead_fingerprints()` 写入。
-                    # 读取（`is_seen`）仍留在候选阶段 —— 去重必须发生在抓详情之前。
+                    # 中文工商名也登记一份（与候选阶段的英文名各占一条哈希）。
+                    # 两者哈希不同（实测 `...CO., LIMITED` 与 `...CO.,LTD` 都算不同哈希），
+                    # 都记上才挡得住"换个写法又来一遍"。
+                    # 回滚同样覆盖它 —— pipeline 撤指纹时会连 `registered_company` 一起撤。
+                    if detail.get("registered_company"):
+                        dedup.add(detail["registered_company"])
 
                     final_products = s.get("raw_products") or detail.get("raw_products") or ""
 
@@ -581,8 +680,9 @@ class GlobalSources(BaseCrawler):
                         leads[i].registered_address = detail.get("registered_address", "")
                     if not leads[i].official_website:
                         leads[i].official_website = detail.get("official_website", "")
-                    # 这里同样不写指纹库 —— 补到名字的这家是否真能入库还没定，
-                    # 统一在落盘成功后由 `commit_lead_fingerprints()` 一起写。
+                    # 重爬补到的中文名也登记一份（与上面详情阶段同口径）。
+                    # 这家最终若被剔除，pipeline 会在剔除时连它一起撤掉。
+                    dedup.add(name)
                     recovered += 1
 
                 print(f"      ↳ 重爬补回中文工商名 {recovered}/{len(missing_idx)} 家")
