@@ -2,8 +2,8 @@ import asyncio
 from pipeline import run_pipeline
 
 TARGET_PLATFORM = "globalsources"
-SEARCH_KEYWORD = "watch"
-SCRAPE_LIMIT = 20
+SEARCH_KEYWORD = "phone"
+SCRAPE_LIMIT = 25
 OUTPUT_FILE = "suppliers_leads.xlsx"
 
 if __name__ == "__main__":

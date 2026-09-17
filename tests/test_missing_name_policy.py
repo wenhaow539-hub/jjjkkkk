@@ -215,11 +215,152 @@ def test_export_drop_urls():
               f"D4 零新增也能删除，剩 {len(df)} 行")
 
 
+# --------------------------------------------------------------------------- #
+# E. 入库门槛：GS 名必须含中文；工商库查不到信息也不入库
+# --------------------------------------------------------------------------- #
+def test_has_chinese_gate():
+    print("\n[E] GS 工商名必须含中文（挡住香港/离岸主体的英文名）")
+    # 实测样本：shenzhenxinlike 的 GS「Registered Company Name」就是纯英文
+    check(pipeline._has_chinese("深圳市鑫利科硅胶制品有限公司"), "E1 中文名 → 通过")
+    check(not pipeline._has_chinese("SHENZHEN XINLIKE SILICONE PRODUCT CO., LIMITED"),
+          "E2 纯英文（离岸主体）→ 拦下，不再让它蒙混进 needing")
+    check(not pipeline._has_chinese(""), "E3 空 → 拦下")
+    check(not pipeline._has_chinese(None), "E4 None → 拦下")
+    check(pipeline._has_chinese("ShenZhen 鑫利科 Co."), "E5 中英混排含中文 → 通过")
+
+
+def _rec(biz: dict, verdict: str = "", attempted: bool = True):
+    enrich = {k: "" for k in pipeline.BUSINESS_RESULT_FIELDS}
+    enrich.update(biz)
+    return {"enrich": enrich, "tyc_enriched": attempted, "enrich_verdict": verdict}
+
+
+def test_business_result_empty():
+    print("\n[E] 工商字段全空的判定与多轮结论合并")
+    check(pipeline._business_result_empty(_rec({})), "E6 全空 → True（应剔除）")
+    check(not pipeline._business_result_empty(_rec({"registered_capital": "50万(元)"})),
+          "E7 只有注册资本 → False（保留）")
+    check(not pipeline._business_result_empty(_rec({"business_status": "开业"})),
+          "E8 只有经营状态 → False（保留）")
+    check(not pipeline._business_result_empty(_rec({"tyc_phone": "0755-12345678"})),
+          "E9 只有联系人电话 → False（保留）")
+    # email / 注册地址不算工商产出（可能来自独立站探测或 GS），不能靠它们让行存活
+    r = _rec({})
+    r["enrich"]["email"] = "a@b.com"
+    check(pipeline._business_result_empty(r), "E10 只有 email → 仍算全空（email 非工商产出）")
+
+    rank = pipeline._VERDICT_RANK
+    check(rank["ok"] > rank["failed"] > rank["not_found"],
+          "E11 多轮取最保守结论：ok > failed > not_found（failed 不当作查不到）")
+
+
+def test_unattempted_is_kept():
+    print("\n[E] 「没查成」不能当成「查不到」")
+    # 熔断跳过 / --no-enrich：tyc_enriched=False
+    r = _rec({}, attempted=False)
+    check(r.get("tyc_enriched") is False,
+          "E12 未执行补全的行 tyc_enriched=False → 上游应保留（删了等于把环境问题算成数据问题）")
+
+
+# --------------------------------------------------------------------------- #
+# F. 天眼查切换：占位符归一 + 登记状态映射（两家 enricher 空值口径相反）
+# --------------------------------------------------------------------------- #
+def test_real_value_normalizes_placeholders():
+    print("\n[F] 占位符归一（天眼查把「没有」写成「有」）")
+    for placeholder in ["未公开", "-", "--", "—", "/", "无", "暂无", "未披露", "无数据", "N/A", "", None]:
+        check(pipeline._real_value(placeholder) == "",
+              f"F1 占位符 {placeholder!r} → 空")
+    check(pipeline._real_value("未公开(元)") == "", "F2 '未公开(元)' 这类前缀占位符也归空")
+    for real in ["100万(元)", "0人", "存续", "开业", "注销", "深圳市某某有限公司"]:
+        check(pipeline._real_value(real) == real, f"F3 真值 {real!r} 原样保留")
+
+
+def test_apply_tianyancha_placeholders():
+    print("\n[F] 天眼查全部占位符 → enrich 不能留下伪值")
+    rec = {"enrich": {k: "" for k in pipeline.BUSINESS_RESULT_FIELDS} | {"email": "", "data_source": ""},
+           "lead": {"company": "X Co", "store_url": "https://x.com", "registered_company": "某公司"}}
+    # 天眼查"查不到"时的真实返回形态
+    info = {"phone": "", "email": "", "contact_person": "", "registered_company": "",
+            "registered_address": "", "registered_capital": "未公开",
+            "paid_in_capital": "-", "insured_count": "未公开", "business_status": ""}
+    pipeline._apply_tianyancha(rec, info)
+    check(not any(rec["enrich"].get(k) for k in pipeline.BUSINESS_RESULT_FIELDS),
+          f"F4 全占位符 → 工商字段全空（实际 {[ (k,rec['enrich'].get(k)) for k in pipeline.BUSINESS_RESULT_FIELDS if rec['enrich'].get(k)]}）")
+    check(rec["enrich"].get("data_source", "") == "", "F5 全占位符 → 不标数据来源")
+    check(pipeline._business_result_empty(rec), "F6 全占位符的行会被「工商全空」门槛剔除")
+
+
+def test_apply_tianyancha_real_values():
+    print("\n[F] 天眼查真实值 + 登记状态映射")
+    rec = {"enrich": {k: "" for k in pipeline.BUSINESS_RESULT_FIELDS} | {"email": "", "data_source": ""},
+           "lead": {"company": "X Co", "store_url": "https://x.com", "registered_company": "某公司"}}
+    info = {"phone": "0755-12345678", "email": "a@b.com", "contact_person": "张三",
+            "contact_title": "法定代表人", "registered_company": "深圳市鑫利科硅胶制品有限公司",
+            "registered_address": "深圳市南山区", "registered_capital": "500万(元)",
+            "paid_in_capital": "100万(元)", "insured_count": "12人", "business_status": "存续"}
+    pipeline._apply_tianyancha(rec, info)
+    e = rec["enrich"]
+    check(e["registered_capital"] == "500万(元)", "F7 注册资本写入")
+    check(e["paid_in_capital"] == "100万(元)", "F8 实缴资本写入")
+    check(e["insured_count"] == "12人", "F9 参保人数写入")
+    check(e["business_status"] == "存续",
+          "F10 天眼查「登记状态」→ 落表「经营状态」列")
+    check(e["data_source"] == "天眼查", "F11 有真值 → 标数据来源")
+    check(not pipeline._business_result_empty(rec), "F12 有真值 → 不会被剔除")
+
+
+def test_classify_result_with_placeholders():
+    print("\n[F] 全占位符不能被判成 ok（否则「查无此企业」永不出现）")
+    placeholder_info = {"registered_capital": "未公开", "paid_in_capital": "-",
+                        "insured_count": "未公开", "phone": "", "registered_company": ""}
+    check(pipeline._classify_result(placeholder_info, raised=False) == "not_found",
+          "F13 全占位符 → not_found")
+    real_info = {"registered_capital": "500万(元)"}
+    check(pipeline._classify_result(real_info, raised=False) == "ok", "F14 有真值 → ok")
+    check(pipeline._classify_result({"last_error": "company_not_found"}, raised=False) == "not_found",
+          "F15 显式查无 → not_found")
+
+
+def test_tianyancha_status_cleaner():
+    print("\n[F] 登记状态提纯")
+    from enrichers.tianyancha import TianyanchaEnricher
+
+    tyc = TianyanchaEnricher()
+    cases = [("存续", "存续"), ("存续（在营、开业、在册）", "存续"), ("存续 2025年报", "存续"),
+             ("注销", "注销"), ("", ""), ("-", "")]
+    for raw, want in cases:
+        got = tyc._clean_status(raw)
+        check(got == want, f"F16 _clean_status({raw!r}) = {got!r} want {want!r}")
+
+
+def test_default_source_is_tianyancha():
+    print("\n[F] 默认数据源已切到天眼查")
+    import inspect
+    import importlib
+
+    sig = inspect.signature(pipeline.run_pipeline)
+    check(sig.parameters["enrich_source"].default == "tianyancha",
+          f"F17 run_pipeline 默认 = {sig.parameters['enrich_source'].default!r}")
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
+               encoding="utf-8").read()
+    check('"--enrich-source"' in src and 'default="tianyancha"' in src,
+          "F18 CLI --enrich-source 默认 = tianyancha")
+
+
 if __name__ == "__main__":
     test_parse_detail_falls_back_to_store_url()
     test_refetch_company_names()
     test_legacy_rows_and_backfill()
     test_export_drop_urls()
+    test_has_chinese_gate()
+    test_business_result_empty()
+    test_unattempted_is_kept()
+    test_real_value_normalizes_placeholders()
+    test_apply_tianyancha_placeholders()
+    test_apply_tianyancha_real_values()
+    test_classify_result_with_placeholders()
+    test_tianyancha_status_cleaner()
+    test_default_source_is_tianyancha()
     print(f"\n失败 {len(_FAILED)} 项")
     for d in _FAILED:
         print(f"   - {d}")

@@ -533,9 +533,12 @@ class GlobalSources(BaseCrawler):
             async def process_item(idx: int, s: dict):
                 async with semaphore:
                     detail = await self._parse_detail(client, s["store_url"])
-                    dedup.add(s["company"])
-                    if detail.get("registered_company"):
-                        dedup.add(detail["registered_company"])
+                    # ⚠️ 这里**不再**写指纹库。
+                    # 旧逻辑在"详情抓取成功"时就写，导致：采到 → 后续因缺中文名/工商库查不到
+                    # 被剔除 → 指纹却已写下 → 这家**永久消失**，以后每次搜索都被跳过。
+                    # 现在统一由流水线在**落盘成功之后**调用
+                    # `utils.dedup.commit_lead_fingerprints()` 写入。
+                    # 读取（`is_seen`）仍留在候选阶段 —— 去重必须发生在抓详情之前。
 
                     final_products = s.get("raw_products") or detail.get("raw_products") or ""
 
@@ -578,7 +581,8 @@ class GlobalSources(BaseCrawler):
                         leads[i].registered_address = detail.get("registered_address", "")
                     if not leads[i].official_website:
                         leads[i].official_website = detail.get("official_website", "")
-                    dedup.add(name)   # 与 process_item 保持一致：补到的中文名也进指纹库
+                    # 这里同样不写指纹库 —— 补到名字的这家是否真能入库还没定，
+                    # 统一在落盘成功后由 `commit_lead_fingerprints()` 一起写。
                     recovered += 1
 
                 print(f"      ↳ 重爬补回中文工商名 {recovered}/{len(missing_idx)} 家")

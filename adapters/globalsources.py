@@ -410,11 +410,11 @@ class GlobalSourcesAdapter(BaseAdapter):
             logger.info(f"      ℹ️ [GS] 资料页无有效字段，跳过: {record.get('store_url')}")
             return 0
 
-        # 与 legacy 一致：详情解析成功后才写入指纹库，避免列表阶段提前占位
-        if company:
-            dedup.add(company)
-        if registered:
-            dedup.add(registered)
+        # ⚠️ 这里**不再**写指纹库。
+        # 旧注释说"详情解析成功后才写入，避免列表阶段提前占位" —— 但"解析成功"仍然
+        # 早于"进报表"，于是被后续门槛剔除的公司指纹已被写下、永久消失。
+        # 现在由 orchestrator 在**落盘成功后**调用 `dedup.commit_lead_fingerprints()`。
+        # `company` / `registered` 留作字段校验，不再用于写库。
 
         self.add_items([record])
         return 1

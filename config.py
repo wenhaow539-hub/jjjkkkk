@@ -66,6 +66,10 @@ TTSHITU_PASSWORD = _first_env("TTSHITU_PASSWORD")
 TTSHITU_TYPEID = _first_env("TTSHITU_TYPEID", default="29")
 YUNMA_TOKEN = _first_env("YUNMA_TOKEN")
 YUNMA_TYPE = _first_env("YUNMA_TYPE", default="900011")
+# 点选类验证码（天眼查的「请在下图依次点击」）走云码的另一个 type：
+# 30009 = 通用任意点选 1~4 个坐标，**人工识别接口**，返回按顺序的坐标。
+# 注意：它比旋转类型贵（约 0.025 元/次），且官方注明「不支持报错退费」。
+YUNMA_POINT_TYPE = _first_env("YUNMA_POINT_TYPE", default="30009")
 
 # 打码 HTTP 超时与「同一张图」的重试次数（页面级的失败重来另算）
 # 图鉴官方文档明确要求超时 ≥60s（人工/人机型接口有时需排队），故默认 60 而非 30。
@@ -88,6 +92,13 @@ CAPTCHA_ANGLE_SIGN = -1.0 if _first_env("CAPTCHA_ANGLE_SIGN", default="1") == "-
 # 真正该"加随机"的地方是**轨迹**（时序/抖动/过冲/中途停顿），那已在 _drag_to_angle 里随机化了。
 # 若仍想试验，建议 ≤1.5px（≈2°）。
 CAPTCHA_LANDING_JITTER_PX = float(_first_env("CAPTCHA_LANDING_JITTER_PX", default="0") or 0)
+# **点选类**验证码落点的二维正态偏移标准差（px），默认 3.0。
+# 注意这里与上面的旋转类型**故意不同**，不是自相矛盾：
+#   · 旋转：服务端不知道"理想落点"，且识别误差本来就让落点变化 → 加偏移纯属吃容差余量，默认 0。
+#   · 点选：服务端**知道每个图形的确切位置**，原样点击会"每次都钉在几何中心"，
+#     这是可统计检测的自动化特征 → 必须带随机偏移。
+# 3px 的依据：蝴蝶类图形约 35~45px 宽（半径 ~20px），3σ 截断到 2σ=6px 仍稳在命中区内。
+CAPTCHA_POINT_JITTER_PX = float(_first_env("CAPTCHA_POINT_JITTER_PX", default="3.0") or 0)
 # 图片预处理：把非正方形的验证码图居中裁成正方形（旋转模型要求方图）。
 # auto = 长宽比偏差超过 5% 才裁；on = 总是裁；off = 不裁。
 CAPTCHA_SQUARE_CROP = _first_env("CAPTCHA_SQUARE_CROP", default="auto").strip().lower() or "auto"
@@ -118,7 +129,8 @@ def captcha_status() -> str:
     provider = auto_captcha_provider()
     if provider == "yunma":
         if YUNMA_TOKEN:
-            return f"平台=云码，token 已配置（...{YUNMA_TOKEN[-4:]}，type={YUNMA_TYPE}）"
+            return (f"平台=云码，token 已配置（...{YUNMA_TOKEN[-4:]}，"
+                    f"旋转 type={YUNMA_TYPE}，点选 type={YUNMA_POINT_TYPE}）")
         return "平台=云码（显式指定），但 YUNMA_TOKEN 为空 → 退化为人工等待"
     if provider == "ttshitu":
         if TTSHITU_USERNAME and TTSHITU_PASSWORD:

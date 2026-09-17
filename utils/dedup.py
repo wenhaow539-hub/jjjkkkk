@@ -70,3 +70,33 @@ class HashDeduplicator:
                 return False
 
 dedup = HashDeduplicator()
+
+
+def commit_lead_fingerprints(leads) -> int:
+    """把**已成功入库**的线索写进指纹库，返回真正新增的条数。
+
+    ⚠️ 只能在**落盘成功之后**调用。
+
+    指纹库的语义应当等价于「这家已经处理完了」，而"处理完"的终点是**进报表**，
+    不是"抓过详情页"。写在采集阶段会形成一个不可逆的漏洞：
+
+        采到 → 因缺中文名 / 工商库查不到被剔除 → 指纹却已经写下了 → **永久消失**，
+        以后每次搜索都会被 `is_seen()` 跳过，再也没机会补救。
+
+    这个坑实测过：`seen_hashes.txt` 累积到 3218 条时，报表只有 286 行 ——
+    差额全是「采过却从未入库」的公司。改成落盘后写，被剔除的公司下轮还能重新采到。
+
+    代价（有意的取舍）：被剔除的公司每轮都会被重新抓一次详情，多花一点请求。
+    换来的是「不漏采」，通常比「省请求」更值。
+
+    每家记**两个**写法：英文公司名 + 中文工商名 —— 两者哈希不同（实测
+    `...CO., LIMITED` 与 `...CO.,LTD` 也会算出不同哈希），都记上才挡得住。
+    """
+    n = 0
+    for lead in leads:
+        for attr in ("company", "registered_company"):
+            name = getattr(lead, attr, "") or ""
+            name = str(name).strip()
+            if name and dedup.add(name):
+                n += 1
+    return n

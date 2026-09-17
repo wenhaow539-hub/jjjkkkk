@@ -43,6 +43,36 @@ class AiQiChaEnricher:
 
     SEARCH_URL = "https://aiqicha.baidu.com/s?q={kw}"
     DETAIL_URL = "https://aiqicha.baidu.com/company_detail_{pid}"
+    # 「进出口信用」在「经营状况」tab 下 —— 与基本信息是**两个 tab**，
+    # 默认 tab 的 HTML 里没有它，所以必须带 URL 参数单独打开一次。
+    CUSTOMS_URL = "https://aiqicha.baidu.com/company_detail_{pid}?tab=operatingCondition"
+
+    # 爱企查的进出口信用是**列式表格**（表头 + 数据行），不是键值对：
+    #     序号 | 注册日期 | 海关注册编码 | 经营类别 | 注册海关 | 操作
+    #     1    | 2020-07-02 | 4401960FEP | 进出口货物收发货人 | 广州车站 | 详情
+    # 所以按**表头文字**定位列下标再取值，不依赖 class（站点改版也不至于全废）。
+    CUSTOMS_EXTRACT_JS = r"""
+        () => {
+            const want = { '海关注册编码': 'code', '注册日期': 'date' };
+            const out = { code: '', date: '', raw: '' };
+            for (const tb of document.querySelectorAll('table')) {
+                const head = (tb.querySelector('tr')?.innerText || '').replace(/\s+/g, '');
+                if (!head.includes('海关注册编码')) continue;
+                const rows = [...tb.querySelectorAll('tr')];
+                if (rows.length < 2) continue;
+                const ths = [...rows[0].children].map(c => (c.innerText || '').replace(/\s+/g, ''));
+                const vals = [...rows[1].children].map(c => (c.innerText || '').replace(/\s+/g, ' ').trim());
+                for (const [label, key] of Object.entries(want)) {
+                    const i = ths.indexOf(label);
+                    if (i >= 0 && vals[i]) out[key] = vals[i];
+                }
+                out.raw = rows.slice(0, 2).map(r =>
+                    [...r.children].map(c => (c.innerText || '').replace(/\s+/g, ' ').trim())).join(' | ');
+                if (out.code || out.date) return out;
+            }
+            return out;
+        }
+    """
     CARD_SELECTOR = ".company-list .card"
 
     # ── 验证码"暂停等待"口径（对齐天眼查 _handle_captcha_if_needed）──────────
@@ -653,6 +683,52 @@ class AiQiChaEnricher:
             return max(0.0, float(timeout))
         except (TypeError, ValueError):
             return self.captcha_wait
+
+    async def _fetch_customs(self, page: Page, pid: str,
+                             captcha_timeout: float | None = None) -> dict:
+        """抓「海关注册编码 / 注册日期」。拿不到就返回空串 —— **绝不阻断主流程**。
+
+        ⚠️ 代价说明：爱企查的进出口信用在「经营状况」tab，与基本信息是两个页面，
+        所以要**多开一次详情页**。这会增加该账号的页面访问量（也就增加验证码风险）。
+        如果你更在意验证码频率而不在意这两个字段，可以关掉这个调用。
+
+        ⚠️ 未经真实 DOM 验证：结构是按用户 2026-09-17 的截图写的
+        （表头 `序号|注册日期|海关注册编码|经营类别|注册海关|操作`）。
+        首次实跑请留意日志里的 `🛃 [爱企查] 海关信息`，取不到我再按真实 DOM 调。
+        """
+        out = {"customs_code": "", "customs_reg_date": ""}
+        if not pid:
+            return out
+        try:
+            await self._respect_captcha_cooldown("进入进出口信用页")
+            await page.goto(self.CUSTOMS_URL.format(pid=pid),
+                            wait_until="domcontentloaded", timeout=35000)
+            self.last_page_url = page.url
+            if not await self.check_and_wait_captcha(page, timeout=captcha_timeout):
+                return out
+            if await self._detect_antibot_page(page, captcha_timeout=captcha_timeout):
+                return out
+            # 等进出口信用表格渲染（等不到 = 这家没有进出口信用，属正常情况）
+            try:
+                await page.wait_for_function(
+                    "() => [...document.querySelectorAll('table')].some(tb =>"
+                    "  ((tb.querySelector('tr')?.innerText) || '').includes('海关注册编码'))",
+                    timeout=12000,
+                    # 见 tianyancha 同名说明：默认 raf 在后台标签页会被暂停
+                    polling=100,
+                )
+            except Exception:
+                return out
+            await self._human_browse(page, scrolls=(1, 1))
+            got = await page.evaluate(self.CUSTOMS_EXTRACT_JS) or {}
+            out["customs_code"] = (got.get("code") or "").strip()
+            out["customs_reg_date"] = (got.get("date") or "").strip()
+            if out["customs_code"] or out["customs_reg_date"]:
+                print(f"      🛃 [爱企查] 海关信息: 注册编码={out['customs_code'] or '—'} "
+                      f"注册日期={out['customs_reg_date'] or '—'}")
+        except Exception as e:
+            print(f"      ⚠️ [爱企查] 海关信息提取异常（不影响其它字段）: {type(e).__name__}: {e}")
+        return out
 
     async def check_and_wait_captcha(self, page: Page, timeout: float | None = None) -> bool:
         """检测验证码并处理。True=可继续；False=未通过（调用方应标记失败并计入熔断）。
@@ -1278,6 +1354,8 @@ class AiQiChaEnricher:
             "email": "",
             "reg_address": "",
             "status": "",
+            "customs_code": "",        # 海关注册编码（经营状况 → 进出口信用，直接可见）
+            "customs_reg_date": "",    # 海关注册日期
             "source": "aiqicha",
             # —— 诊断字段 ——
             "matched_name": "",
@@ -1325,7 +1403,9 @@ class AiQiChaEnricher:
                         || /暂无数据|没有找到|未找到相关|换个词试试|无相关结果/.test(
                                document.body ? document.body.innerText : '')""",
                     arg=self.CARD_SELECTOR,
-                    timeout=render_timeout * 1000,
+                    timeout=10000,
+                    # 见 tianyancha 同名说明：默认 raf 在后台标签页会被暂停
+                    polling=100,
                 )
             except Exception:
                 self.last_error = "no_result_cards"
@@ -1384,6 +1464,8 @@ class AiQiChaEnricher:
                 await page.wait_for_function(
                     "() => /参保人数|统一社会信用代码|实缴资本|成立日期/.test(document.body.innerText)",
                     timeout=render_timeout * 1000,
+                    # 见 tianyancha 同名说明：默认 raf 在后台标签页会被暂停
+                    polling=100,
                 )
             except Exception:
                 self.last_error = "detail_not_rendered"
@@ -1408,6 +1490,9 @@ class AiQiChaEnricher:
                 if len(v) <= 1 and k in ("legal_person", "status"):
                     continue
                 data[k] = v
+
+            # 海关信息：在另一个 tab，单独开一次（失败不影响上面的字段）
+            data.update(await self._fetch_customs(page, card["pid"], captcha_timeout))
 
         except Exception as e:
             self.last_error = f"{type(e).__name__}:{str(e)[:80]}"

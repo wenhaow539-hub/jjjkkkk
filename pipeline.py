@@ -17,6 +17,7 @@ from enrichers.tianyancha import TianyanchaEnricher
 from enrichers.website import WebsiteEnricher
 from exporters.excel import export_leads_to_excel
 from models import RawSupplierLead
+from utils.dedup import commit_lead_fingerprints
 from utils.logger import get_logger
 
 logger = get_logger("pipeline")
@@ -83,6 +84,8 @@ def _new_record(lead: RawSupplierLead) -> dict:
             # —— 工商补全来源与状态（爱企查切换新增）——
             "data_source": "",        # 数据来源：爱企查 / 天眼查（落表）
             "business_status": "",    # 经营状态（落表）
+            "customs_code": "",       # 海关注册编码（落表）
+            "customs_reg_date": "",   # 海关注册日期（落表）
             # 以下仅存于 dict，暂不落表，便于后续扩展与排查
             "registered_company": "",
             "credit_code": "",
@@ -92,6 +95,7 @@ def _new_record(lead: RawSupplierLead) -> dict:
         "llm_evaluated": False,
         "eval": None,
         "tyc_enriched": False,
+        "enrich_verdict": "",      # ok / not_found / failed，由 _enrich_business 写入
     }
 
 
@@ -106,8 +110,61 @@ def _record_key(store_url: str, company: str = "") -> str:
 #   ① 环球资源没爬到中文名 → 同轮内立即重爬一次（crawler 内部已做）；
 #   ② 重爬仍无 → 不入库 / 删除；
 #   ③ **只认环球资源**——爱企查或大模型补到中文名不算"有"，不阻止删除；
-#   ④ 指纹库**保留**（dedup.add 已写入，不回退）⇒ 这家以后不会再被采到，
-#      不会陷入「采到 → 没中文名 → 删 → 又采到」的循环。
+#   ④ 指纹库**只在成功入库后**才写（见 `utils.dedup.commit_lead_fingerprints`）。
+#      所以被这里剔除的家**不会**进指纹库 ⇒ 下一轮还会被重新采到、再给一次机会。
+#      有意如此：宁可多花几次详情请求，也不要"一次没爬到就永久丢掉这家"。
+def _has_chinese(text: str) -> bool:
+    return bool(re.search(r'[\u4e00-\u9fa5]', text or ""))
+
+
+# —— 工商字段的"伪值"归一 ——
+# 两家 enricher 对"没有数据"的处理**刚好相反**：
+#   · 爱企查：占位符归一成空串（`aiqicha.PLACEHOLDER_PREFIXES`）
+#   · 天眼查：空值归一成 `未公开` / `-`（`_clean_capital()` 等，等于把"没有"写成了"有"）
+# 不统一拦掉会同时踩三个坑：
+#   ① 切天眼查后表里填满 `未公开` 这种伪值；
+#   ② `_business_result_empty()` 判定"工商字段全空"时会因伪值非空而产生漏判；
+#   ③ `_classify_result()` 恒判 ok ⇒ 「站内查无此企业」永远不会出现。
+PLACEHOLDER_EXACT = {
+    "-", "--", "—", "/", "无", "暂无", "未公开", "未公布", "未披露", "未公示", "无数据",
+    "null", "none", "n/a", "na", "登录", "查看", "详情",
+}
+PLACEHOLDER_PREFIXES = ("暂无", "未公开", "未公布", "未披露", "未公示", "无数据")
+
+
+def _real_value(value) -> str:
+    """取工商字段的真实值：占位符一律当作"没有值"（返回空串）。"""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    if s in PLACEHOLDER_EXACT or s.lower() in PLACEHOLDER_EXACT:
+        return ""
+    if s.startswith(PLACEHOLDER_PREFIXES):
+        return ""
+    return s
+
+
+# 落表的「工商类」字段。判定"工商补全有没有拿到东西"只看这几个 ——
+# 不含 email 与注册地址：那两个可能来自独立站探测或 GS 详情页，不能算爱企查的产出。
+BUSINESS_RESULT_FIELDS = (
+    "registered_capital", "paid_in_capital", "insured_count",
+    "business_status", "contact_person", "tyc_phone",
+)
+
+# 多轮补全（both 模式）取"最保守"的结论：ok > failed > not_found。
+# 只有**每一轮都判查无**才认作查无；只要有一轮是环境异常（验证码/被拦）就不删，
+# 免得把"没查成"误当成"查不到"而删掉本可以拿到的数据。
+_VERDICT_RANK = {"ok": 2, "failed": 1, "not_found": 0}
+
+
+def _business_result_empty(rec: dict) -> bool:
+    """工商类字段是否全空（`未公开`/`-` 这类伪值算空）。"""
+    enrich = rec.get("enrich") or {}
+    return not any(_real_value(enrich.get(k)) for k in BUSINESS_RESULT_FIELDS)
+
+
 def _cell_str(value) -> str:
     """Excel 单元格 → 干净字符串。
 
@@ -255,32 +312,51 @@ def _search_target(rec: dict) -> tuple[str, str]:
 # 工商补全：结果映射（纯函数，可离线单测）
 # --------------------------------------------------------------------------- #
 def _apply_tianyancha(rec: dict, info: dict) -> None:
-    """天眼查返回 → rec。行为与改动前完全一致，只多写一个数据来源标记。"""
+    """天眼查返回 → rec。
+
+    与改动前的差异只有两处：
+      ① 所有取值都过 `_real_value()` —— 天眼查把"没有数据"归一成 `未公开`/`-`，
+         直接落表会在表里留下伪值，并让「工商字段全空则不入库」判定失效；
+      ② 新增 `business_status`（天眼查叫「登记状态」）映射到「经营状态」列，
+         与爱企查的 status 对齐。
+    其余映射保持原样。
+    """
     if not info:
         info = {}
     enrich = rec["enrich"]
     lead = RawSupplierLead(**rec["lead"])
 
-    if info.get("phone"):
-        enrich["tyc_phone"] = info["phone"]
-    if not enrich.get("email") and info.get("email"):
-        enrich["email"] = info["email"]
-    if info.get("contact_person"):
-        enrich["contact_person"] = info["contact_person"]
-        enrich["contact_title"] = info.get("contact_title", "法定代表人")
-    if info.get("registered_company"):
-        enrich["registered_company"] = info["registered_company"]
-    if not lead.registered_address and info.get("registered_address"):
-        lead.registered_address = info["registered_address"]
+    phone = _real_value(info.get("phone"))
+    if phone:
+        enrich["tyc_phone"] = phone
+    email = _real_value(info.get("email"))
+    if not enrich.get("email") and email:
+        enrich["email"] = email
+    person = _real_value(info.get("contact_person"))
+    if person:
+        enrich["contact_person"] = person
+        enrich["contact_title"] = info.get("contact_title") or "法定代表人"
+    reg_name = _real_value(info.get("registered_company"))
+    if reg_name:
+        enrich["registered_company"] = reg_name
+    addr = _real_value(info.get("registered_address"))
+    if not lead.registered_address and addr:
+        lead.registered_address = addr
         rec["lead"] = lead.model_dump()
-    if info.get("registered_capital"):
-        enrich["registered_capital"] = info["registered_capital"]
-    if info.get("paid_in_capital"):
-        enrich["paid_in_capital"] = info["paid_in_capital"]
-    if info.get("insured_count"):
-        enrich["insured_count"] = info["insured_count"]
 
-    if any(info.get(k) for k in ("phone", "email", "contact_person", "registered_capital", "insured_count")):
+    for src_key, dst_key in (("registered_capital", "registered_capital"),
+                             ("paid_in_capital", "paid_in_capital"),
+                             ("insured_count", "insured_count"),
+                             ("business_status", "business_status"),
+                             ("customs_code", "customs_code"),
+                             ("customs_reg_date", "customs_reg_date")):
+        v = _real_value(info.get(src_key))
+        if v:
+            enrich[dst_key] = v
+
+    if any(_real_value(info.get(k)) for k in
+           ("phone", "email", "contact_person", "registered_capital", "insured_count",
+            "business_status", "registered_address")):
         enrich["data_source"] = "天眼查"
 
 
@@ -298,24 +374,31 @@ def _apply_aiqicha(rec: dict, info: dict) -> None:
     enrich = rec["enrich"]
     lead = RawSupplierLead(**rec["lead"])
 
-    if info.get("legal_person"):
+    # 取值一律过 _real_value()：爱企查虽已在 enricher 内归一占位符，这里再兜一层，
+    # 保证两家数据源的落表口径完全一致（`未公开`/`-`/`无` 都不算值）。
+    if _real_value(info.get("legal_person")):
         enrich["contact_person"] = info["legal_person"]
         enrich["contact_title"] = "法定代表人"
-    if info.get("phone"):
+    if _real_value(info.get("phone")):
         enrich["tyc_phone"] = info["phone"]
-    if not enrich.get("email") and info.get("email"):
+    if not enrich.get("email") and _real_value(info.get("email")):
         enrich["email"] = info["email"]
-    if info.get("reg_capital"):
+    if _real_value(info.get("reg_capital")):
         enrich["registered_capital"] = info["reg_capital"]
-    if info.get("paid_capital"):
+    if _real_value(info.get("paid_capital")):
         enrich["paid_in_capital"] = info["paid_capital"]
-    if info.get("insured_users"):
+    if _real_value(info.get("insured_users")):
         enrich["insured_count"] = info["insured_users"]
-    if not lead.registered_address and info.get("reg_address"):
+    if not lead.registered_address and _real_value(info.get("reg_address")):
         lead.registered_address = info["reg_address"]
         rec["lead"] = lead.model_dump()
-    if info.get("status"):
+    if _real_value(info.get("status")):
         enrich["business_status"] = info["status"]
+    # 海关信息（进出口信用）：爱企查在「经营状况」tab，天眼查要点「详情」
+    if _real_value(info.get("customs_code")):
+        enrich["customs_code"] = info["customs_code"]
+    if _real_value(info.get("customs_reg_date")):
+        enrich["customs_reg_date"] = info["customs_reg_date"]
     # 爱企查卡片上的企业名就是工商登记名；仅当原线索没有中文全称时才采用，
     # 避免覆盖 LLM 质检（clean_company_name）与已有数据
     if not lead.registered_company and info.get("matched_name"):
@@ -327,7 +410,9 @@ def _apply_aiqicha(rec: dict, info: dict) -> None:
         if info.get(src_key):
             enrich[dst_key] = info[src_key]
 
-    if any(info.get(k) for k in ("legal_person", "phone", "reg_capital", "reg_address", "insured_users")):
+    if any(_real_value(info.get(k)) for k in
+           ("legal_person", "phone", "reg_capital", "reg_address", "insured_users",
+            "paid_capital", "status")):
         enrich["data_source"] = "爱企查"
 
 
@@ -350,8 +435,13 @@ def _classify_result(info: dict, raised: bool) -> str:
     err = str(info.get("last_error") or "")
     if info.get("blocked") or err.startswith("captcha_"):
         return "failed"
-    if any(info.get(k) for k in ("legal_person", "phone", "reg_capital", "reg_address",
-                                 "insured_users", "contact_person", "registered_capital")):
+    # 判据必须过 `_real_value()`：天眼查把"没有数据"写成 `未公开`/`-`，
+    # 直接用 `info.get(k)` 判真假会恒为真 → 永远返回 ok → 「站内查无此企业」再也不出现，
+    # 「工商全空则不入库」的门槛也跟着失效（两个坑是同一个根因）。
+    if any(_real_value(info.get(k)) for k in (
+            "legal_person", "phone", "reg_capital", "reg_address", "insured_users",
+            "contact_person", "registered_capital", "paid_capital", "insured_count",
+            "registered_address", "status", "business_status")):
         return "ok"
     if err in BENIGN_ERRORS:
         return "not_found"
@@ -410,7 +500,11 @@ async def _enrich_business(
         if name == "aiqicha":
             enricher = AiQiChaEnricher(captcha_mode=captcha_mode, captcha_provider=captcha_provider)
         else:
-            enricher = TianyanchaEnricher()
+            enricher = TianyanchaEnricher(
+                captcha_mode=captcha_mode,
+                captcha_provider=captcha_provider,
+                captcha_wait=captcha_wait,
+            )
         apply_fn = _apply_aiqicha if name == "aiqicha" else _apply_tianyancha
         label = ENRICH_SOURCE_LABELS.get(name, name)
         consecutive_failed = 0
@@ -435,6 +529,10 @@ async def _enrich_business(
 
             verdict = _classify_result(info, raised)
             stats[verdict] += 1
+            # 把判定结果留在 rec 上，供上游决定「工商全空的行走不进库」。
+            # 多轮取最保守结论（见 _VERDICT_RANK），避免把"没查成"当成"查不到"。
+            if _VERDICT_RANK.get(verdict, 0) > _VERDICT_RANK.get(rec.get("enrich_verdict"), -1):
+                rec["enrich_verdict"] = verdict
             if verdict == "failed":
                 consecutive_failed += 1
                 logger.warning(f"      ⚠️ [{label} {idx}/{len(recs)}] 未取到数据: {target}"
@@ -467,17 +565,17 @@ async def run_pipeline(
     output_file: str = "suppliers_leads.xlsx",
     enrich_websites: bool = True,
     enrich_tianyancha: bool = True,
-    enrich_source: str = "aiqicha",
+    enrich_source: str = "tianyancha",
     resume: bool = True,
     captcha_mode: str = "auto",
     captcha_provider: str | None = None,
     captcha_wait: float | None = None,
     drop_missing_name: bool = True,
 ):
-    source = (enrich_source or "aiqicha").strip().lower()
+    source = (enrich_source or "tianyancha").strip().lower()
     if source not in ENRICH_SOURCES:
-        logger.warning(f"⚠️ [Pipeline] 未知数据源 {enrich_source!r}，回退为 aiqicha（可选: {', '.join(ENRICH_SOURCES)}）")
-        source = "aiqicha"
+        logger.warning(f"⚠️ [Pipeline] 未知数据源 {enrich_source!r}，回退为 tianyancha（可选: {', '.join(ENRICH_SOURCES)}）")
+        source = "tianyancha"
 
     mode = (captcha_mode or "auto").strip().lower()
     if mode not in CAPTCHA_MODES:
@@ -489,26 +587,48 @@ async def run_pipeline(
     logger.info(f"🌐 目标平台: {platform} | 关键词: {keyword} | 本次计划采集: {max_count}")
     logger.info(f"🧩 工商补全数据源: {ENRICH_SOURCE_LABELS[source]}"
                 f"{'（已关闭，--no-enrich）' if not enrich_tianyancha else ''}")
-    logger.info(f"🔐 验证码策略: {CAPTCHA_MODE_LABELS[mode]}（人工等待 {max(0.0, captcha_wait if captcha_wait is not None else config.CAPTCHA_WAIT_SECONDS):.0f}s） | {config.captcha_status()}")
+    wait_secs = max(0.0, captcha_wait if captcha_wait is not None else config.CAPTCHA_WAIT_SECONDS)
+    if source == "tianyancha":
+        # 天眼查是**两段式点选**验证码（先点按钮 → 再按箭头提示顺序点图形），
+        # 走云码的人工点选接口 type=30009（约 0.025 元/次，比旋转类型贵，且不报错退费）。
+        logger.info(f"🔐 验证码策略: {CAPTCHA_MODE_LABELS[mode]}（人工等待上限 {wait_secs:.0f}s）"
+                    f"｜天眼查为两段式**点选**，需云码 type={config.YUNMA_POINT_TYPE}；"
+                    f"另有每 17~20 家 45~60s 大休眠")
+        logger.info(f"   {config.captcha_status()}")
+    else:
+        logger.info(f"🔐 验证码策略: {CAPTCHA_MODE_LABELS[mode]}（人工等待 {wait_secs:.0f}s） | {config.captcha_status()}")
     logger.info(f"💾 断点续采: {'开' if resume else '关'} | 输出: {output_file}")
     logger.info("=======================================================")
 
-    logger.info(f"🧹 无中文名处置: {'删除（环球资源重爬一次仍无中文名即剔除）' if drop_missing_name else '保留（--keep-missing-name）'}")
+    logger.info(f"🧹 入库门槛: " + (
+        "要求「GS 有中文工商名」且「工商库能查到信息」，不满足即剔除"
+        if drop_missing_name else "不设门槛，全部入库（--keep-missing-name）"))
 
     crawler = CrawlerFactory.get_crawler(platform)
     fresh_leads: list[RawSupplierLead] = await crawler.scrape(keyword=keyword, max_count=max_count)
 
     # 1.5 「环球资源没爬到中文名 → 重爬一次 → 仍无则剔除」
-    # crawler 内部已经同轮重试过一次（含冷却），到这里仍为空的就是确认取不到的。
+    # crawler 内部已经同轮重试过一次（含冷却），到这里仍没有中文名的就是确认取不到的。
+    #
+    # ⚠️ 判定必须是「**含中文**」而不是「非空」——实测踩到：
+    # 香港/离岸主体的 GS「Registered Company Name」是纯英文
+    # （`SHENZHEN XINLIKE SILICONE PRODUCT CO., LIMITED`），
+    # 按"非空"判定会放它过关；随后 `_search_target()` 返回这个英文名，
+    # `needing` 的 has_chinese 过滤判假 → **整家被跳过工商补全** →
+    # 表里留下一条「中文名有（LLM 译名回填）、工商字段全空」的废行。
     if drop_missing_name:
         kept, dropped = [], []
         for ld in fresh_leads:
-            (kept if (ld.registered_company or "").strip() else dropped).append(ld)
+            name = (ld.registered_company or "").strip()
+            (kept if _has_chinese(name) else dropped).append(ld)
         if dropped:
-            logger.info(f"\n🧹 [入库前过滤] {len(dropped)} 家重爬一次后仍无中文工商名，本次不入库"
-                        f"（指纹已保留 ⇒ 以后不会再采到；想留着这些行请加 --keep-missing-name）")
+            logger.info(f"\n🧹 [入库前过滤] {len(dropped)} 家没有中文工商名，本次不入库"
+                        f"（未登记指纹 ⇒ 下一轮还会重新采到、再试一次；"
+                        f"想留着这些行入库请加 --keep-missing-name）")
             for ld in dropped:
-                logger.info(f"      ✗ 剔除: {ld.company} | {ld.store_url}")
+                raw = (ld.registered_company or "").strip()
+                why = f"GS 只给了英文名 {raw!r}（多为香港/离岸主体）" if raw else "GS 未爬到工商名"
+                logger.info(f"      ✗ 剔除: {ld.company} | {ld.store_url} —— {why}")
         fresh_leads = kept
 
     if not fresh_leads:
@@ -619,6 +739,33 @@ async def run_pipeline(
                     finally:
                         await page.close()
 
+    # 4.5 工商补全后工商类字段**全空**的行 → 不入库
+    # 用户口径：在工商库里查不到信息的商户没有价值，不进报表。
+    if drop_missing_name and records:
+        kept, dropped, unattempted = {}, [], []
+        for key, rec in records.items():
+            if not rec.get("tyc_enriched"):
+                # 从没查过（熔断跳过 / --no-enrich）—— 这不是"查不到"，是"没查成"，
+                # 删掉等于把环境问题算成数据问题，故保留并提示。
+                unattempted.append(rec)
+                kept[key] = rec
+                continue
+            if _business_result_empty(rec) and rec.get("enrich_verdict") != "failed":
+                dropped.append(rec)
+            else:
+                kept[key] = rec
+        if dropped:
+            logger.info(f"\n🧹 [入库前过滤] {len(dropped)} 家在工商库中查不到任何信息"
+                        f"（注册资本/实缴/参保/经营状态/联系人/电话 全空），本次不入库")
+            for rec in dropped:
+                ld = RawSupplierLead(**rec["lead"])
+                logger.info(f"      ✗ 剔除: {ld.company} | {ld.store_url}"
+                            f" —— 判定 {rec.get('enrich_verdict') or '无数据'}")
+        if unattempted:
+            logger.warning(f"      ⚠️ 另有 {len(unattempted)} 家**未执行**工商补全（熔断跳过或 --no-enrich），"
+                           f"已保留入库（它们不算'查不到'）。要清理请重跑补齐后再判定。")
+        records = kept
+
     # 5. 存量报表里「无中文名」的历史行：重爬一次，仍取不到则删除
     drop_urls: set[str] = set()
     if drop_missing_name:
@@ -639,6 +786,18 @@ async def run_pipeline(
         output_file=output_file,
         drop_urls=drop_urls,
     )
+
+    # 7. 落盘**成功之后**才写指纹库。
+    # 位置刻意放在 export 之后而不是采集阶段：指纹库的语义是「这家已经进了报表」，
+    # 早写会让「采到 → 被剔除 → 指纹已写 → 永久消失」成立（实测 3218 条指纹只对应
+    # 286 行报表）。放这里还有两个好处：
+    #   · 导出抛异常 ⇒ 指纹不写 ⇒ 这批下轮还能重来；
+    #   · 中途 Ctrl-C ⇒ 同理，不会留下"没入库却被标记已处理"的孤儿。
+    # 注意这里用的是 `leads_data`（= records，已剔除无中文名/工商全空的家），
+    # 所以写进去的都是**确实进过报表**的公司。
+    written = commit_lead_fingerprints(leads_data)
+    logger.info(f"🔑 [指纹库] 已为本次入库的 {len(leads_data)} 家商户登记指纹"
+                f"（新增 {written} 条；重复写法不会重复计）")
 
 
 if __name__ == "__main__":

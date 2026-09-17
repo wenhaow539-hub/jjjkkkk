@@ -104,15 +104,17 @@ def build_parser() -> argparse.ArgumentParser:
     # --pipeline 专用
     parser.add_argument("--no-enrich", action="store_true", help="--pipeline：跳过独立站探测与工商补全")
     parser.add_argument("--no-resume", action="store_true", help="--pipeline：不使用断点续采")
-    parser.add_argument("--enrich-source", choices=["aiqicha", "tianyancha", "both"], default="aiqicha",
-                        help="--pipeline：工商补全数据源（默认 aiqicha 爱企查；both=爱企查优先+天眼查兜底）")
+    parser.add_argument("--enrich-source", choices=["aiqicha", "tianyancha", "both"], default="tianyancha",
+                        help="--pipeline：工商补全数据源（默认 tianyancha 天眼查；"
+                             "aiqicha=爱企查；both=爱企查优先+天眼查兜底）")
     parser.add_argument("--captcha-mode", choices=["auto", "manual", "off"], default="auto",
                         help="--pipeline：验证码策略。auto=先自动打码（需 .env 配打码平台）失败转人工；"
                              "manual=仅人工等待（改动前行为）；off=无人值守，命中即跳过该家（默认 auto）")
     parser.add_argument("--captcha-provider", choices=["auto", "ttshitu", "yunma", "none"], default="auto",
                         help="--pipeline：打码平台。auto=按 .env 里哪家凭据齐全自动选（默认）；none=禁用自动打码")
     parser.add_argument("--keep-missing-name", action="store_true",
-                        help="--pipeline：保留环球资源未爬到中文工商名的商户（默认重爬一次仍无则剔除/删除）")
+                        help="--pipeline：保留「环球资源无中文工商名」与「工商库查不到信息」的商户"
+                             "（默认两类都不入库；重爬一次仍无中文名也会剔除）")
     parser.add_argument("--captcha-wait", type=float, default=None,
                         help="--pipeline：人工等待验证码的秒数（默认取 .env 的 CAPTCHA_WAIT_SECONDS，即 240；0=不等待）")
     parser.add_argument("--refresh", action="store_true",
@@ -216,6 +218,13 @@ async def run_adapter(args) -> int:
                 keyword=args.keyword,
                 output_file=args.excel,
             )
+
+            # 落盘成功之后才写指纹库（adapter 的 `_emit_company` 已不再写）。
+            # 与 pipeline 路径保持同一口径：指纹 = 「已进报表」，不是「抓过详情」。
+            from utils.dedup import commit_lead_fingerprints
+
+            written = commit_lead_fingerprints(leads)
+            logger.info(f"🔑 [指纹库] 已为本次入库的 {len(leads)} 家商户登记指纹（新增 {written} 条）")
     for err in result.errors[:10]:
         print(f"  ⚠️ {err}")
     return 0 if result.status != "failed" else 1

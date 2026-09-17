@@ -14,6 +14,8 @@ TARGET_COLUMNS = [
     "实缴资本",
     "参保人数",
     "经营状态",  # 👈 新增（爱企查提供）
+    "海关注册编码",
+    "海关注册日期",
     "公司注册地址",
     "天眼查联系人",
     "天眼查联系人职位",
@@ -78,6 +80,8 @@ def export_leads_to_excel(
             "实缴资本": enrich_res.get("paid_in_capital", "未公开"),
             "参保人数": enrich_res.get("insured_count", "未公开"),
             "经营状态": enrich_res.get("business_status", ""),
+            "海关注册编码": enrich_res.get("customs_code", ""),
+            "海关注册日期": enrich_res.get("customs_reg_date", ""),
             "公司注册地址": company_address,
             "天眼查联系人": enrich_res.get("contact_person", ""),
             "天眼查联系人职位": enrich_res.get("contact_title", ""),
@@ -143,6 +147,7 @@ def export_leads_to_excel(
             "所属行业", "年限", "官网联系方式", "天眼查联系方式", "email", "入库时间",
             "公司注册地址", "平台网址", "独立站", "网址是否有备案",
             "注册资本", "实缴资本", "参保人数", "经营状态", "数据来源",
+            "海关注册编码", "海关注册日期",
         ]
         for col_idx, col_name in enumerate(final_df.columns, start=1):
             is_text = col_name in text_cols
