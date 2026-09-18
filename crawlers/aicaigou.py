@@ -65,7 +65,7 @@ class AiCaiGouCrawler(BaseCrawler):
                 context = browser.contexts[0] if browser.contexts else await browser.new_context()
                 page = await context.new_page()
             except Exception as e:
-                print(f"❌ [{self.platform_name}] 无法连接到 Chrome 端口 9222: {e}")
+                print(f"❌ [{self.platform_name}] 无法连接到 Chrome 端口 {self.cdp_port}: {e}")
                 return []
 
             try:

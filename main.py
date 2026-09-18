@@ -96,6 +96,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="--pipeline：关掉「异步预取」（默认开）。开着时，本批的工商补全会"
                              "与下一批的「GS 采集 + 独立站 + LLM」**并行**——补全大半时间在冷却等待，"
                              "浏览器是空转的，正好用来备下一批。关掉则退回严格串行（更稳，但慢）")
+    parser.add_argument("--streams", type=int, default=None, metavar="N",
+                        help="--pipeline：并行几条流水线（= 几台浏览器）。默认取 .env 的 NUM_STREAMS，"
+                             "当前默认 2。设 1 退回单浏览器。每条流各自入库 -n 家，所以"
+                             "总量 ≈ N × -n。两条流扫**不相交的列表页**（A 扫 1/3/5…、B 扫 2/4/6…）")
+    parser.add_argument("--no-dual", action="store_true",
+                        help="--pipeline：强制单浏览器（等价于 --streams 1）")
+    parser.add_argument("--login-browser", default=None, metavar="NAME",
+                        help="一次性设置：拉起指定浏览器（如 B）并打开天眼查/爱企查登录页，"
+                             "等你登录完后写入登录标记。双浏览器首次使用前必须跑一次，"
+                             "否则那条流的工商补全会全线失败")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help=f"--pipeline 模式的 Excel 输出（默认 {DEFAULT_OUTPUT}）")
     parser.add_argument("--excel", default=None, help="adapter 模式把线索导出到该 Excel 文件")
 
@@ -251,16 +261,28 @@ async def run_adapter(args) -> int:
 # 路径 2：原有数据处理流程（不改动 pipeline 模块）
 # --------------------------------------------------------------------------- #
 async def run_pipeline_entry(args) -> int:
-    from pipeline import run_pipeline  # 懒加载；pipeline.py 保持原样未改动
+    import config
+    from pipeline import run_dual_pipeline, run_pipeline
 
     platform = (args.platform or DEFAULT_PLATFORM).lower()
+
+    # 需要几台浏览器：--no-dual > --streams > .env 的 NUM_STREAMS
+    streams = 1 if args.no_dual else (args.streams if args.streams is not None else config.NUM_STREAMS)
+    streams = max(1, int(streams))
+    if streams > len(config.BROWSER_PROFILES):
+        # 想跑 3 台但只配了 2 台 —— 静默按 2 台跑会让人以为配置没生效
+        logger.warning(f"⚠️ [main] 要求 {streams} 台浏览器，但 NUM_STREAMS={config.NUM_STREAMS} "
+                       f"只配了 {len(config.BROWSER_PROFILES)} 台 → 按 {len(config.BROWSER_PROFILES)} 台跑。"
+                       f"要更多请调大 .env 里的 NUM_STREAMS（并配好对应 profile 的登录态）")
+    profiles = list(config.BROWSER_PROFILES)[:streams]
+
     logger.info(
         f"🚀 [main] pipeline 模式（委派 run_pipeline）| 平台={platform} | 关键词={args.keyword} | "
         f"上限={args.limit} | 输出={args.output} | 增强={'关' if args.no_enrich else '开'} | "
         f"工商数据源={args.enrich_source} | 验证码={args.captcha_mode}({args.captcha_provider}) | "
-        f"断点续采={'关' if args.no_resume else '开'}"
+        f"断点续采={'关' if args.no_resume else '开'} | 浏览器={len(profiles)} 台"
     )
-    await run_pipeline(
+    common = dict(
         keyword=args.keyword,
         platform=platform,
         max_count=args.limit,
@@ -277,7 +299,29 @@ async def run_pipeline_entry(args) -> int:
         reset_pages=args.reset_pages,
         async_prefetch=not args.no_async_prefetch,
     )
+    if len(profiles) > 1:
+        # 双浏览器：一个进程里并行跑两条完整流水线（各用一台 Chrome）
+        await run_dual_pipeline(profiles=profiles, **common)
+    else:
+        await run_pipeline(profile=profiles[0] if profiles else None, **common)
     return 0
+
+
+async def run_login_browser(args) -> int:
+    """`--login-browser B`：拉起指定浏览器并引导人工登录，然后写标记。"""
+    import config
+    from utils.browser_setup import open_for_login
+
+    name = str(args.login_browser).strip().upper()
+    by_name = {p.name.upper(): p for p in config.BROWSER_PROFILES}
+    if name not in by_name:
+        logger.error(f"❌ 未知浏览器 {args.login_browser!r}。"
+                     f"当前配置里有: {', '.join(by_name) or '(无)'}"
+                     f"（由 NUM_STREAMS 决定有几台，见 .env）")
+        return 2
+    profile = by_name[name]
+    ok = await open_for_login(profile)
+    return 0 if ok else 1
 
 
 # --------------------------------------------------------------------------- #
@@ -424,6 +468,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.doctor:
         return run_doctor(args)
+
+    # 一次性设置：给指定浏览器建立登录态（双浏览器首次使用前必跑）
+    if args.login_browser:
+        return asyncio.run(run_login_browser(args))
 
     if any((args.selfcheck, args.discover, args.replay)):
         return forward_to_engine(args)

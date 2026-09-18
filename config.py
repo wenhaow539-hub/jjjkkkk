@@ -115,6 +115,19 @@ DETAIL_RATE_MIN_INTERVAL = float(_first_env("DETAIL_RATE_MIN_INTERVAL", default=
 DETAIL_RATE_JITTER = float(_first_env("DETAIL_RATE_JITTER", default="0.35") or 0.35)
 
 
+# —— GS 搜索列表的翻页深度 ——
+# ⚠️ 这个值曾经写死 25，是**真实踩到的坑**（2026-09-18）：
+#    实测 `phone + China-Guangdong + 5年内` 在 GS 上有 **62 页**（每页 20 家 ≈ 1240 家），
+#    而代码只让扫到第 25 页 —— 前 25 页被采完之后，26 页往后**永远扫不到**。
+#    表现不是报错，而是"候选入库 +0 家"反复出现 → `run_pipeline` 判为
+#    「连续 2 批零新增、候选池枯竭」并提前退出，看起来像"这个关键词没数据了"。
+#    实际是**代码自己把池子砍掉了六成**。
+# 放心调大：翻页循环里有"空页检测"（`query_selector_all` 返回空即 break），
+#    页数上限设得比实际大不会白跑 —— 扫到底自然停，只多花一次请求。
+# 成本：每页约 8~10s（加载 ~2s + 就绪停顿 2~3s + 滚动 3 次 + 翻页冷却 1.5~2.5s）。
+GS_MAX_SEARCH_PAGES = int(_first_env("GS_MAX_SEARCH_PAGES", default="100") or 100)
+
+
 def detail_rate_status() -> str:
     """详情页限速的一行摘要（启动横幅 / GS 详情阶段打印用）。"""
     lo = DETAIL_RATE_MIN_INTERVAL * (1 - DETAIL_RATE_JITTER)
@@ -167,6 +180,111 @@ def api_key_status() -> str:
     if not OPENAI_API_KEY:
         return "未配置（大模型质检将走内置降级）"
     return f"已配置（...{OPENAI_API_KEY[-4:]}，长度 {len(OPENAI_API_KEY)}）"
+
+
+# =========================================================================== #
+# 双浏览器 / 多账号（单进程内并行）
+# =========================================================================== #
+# 目标：一个 Python 进程里同时驱动两台 Chrome，各跑一套完整流水线。
+#   · 浏览器 A —— 本机直连，沿用现有 chrome_debug_profile（登录态已在，无需重登）
+#   · 浏览器 B —— 走 HTTP 代理，独立 profile 目录（**需要先手动登录一次**）
+# 一个 profile 目录 = 一组登录态（天眼查 + 爱企查），所以 2 台 = 4 个账号。
+# 账号密码**不写在这里** —— Chrome 的登录态是跟 user-data-dir 走的，
+# 用 `python main.py --login-browser B` 拉起窗口手动登一次即可。
+#
+# ⚠️ 退回单浏览器：把 NUM_STREAMS 设为 1（或 run_mvp.py 里改常量）。
+NUM_STREAMS = max(1, int(_first_env("NUM_STREAMS", default="2") or 2))
+
+# 人工等待登录的上限（秒）。浏览器 B 的 profile 是全新的、没有任何登录态，
+# 首次跑双流时若直接进补全，天眼查/爱企查会全线失败。启动时会检查一次登录态，
+# 未登录就提示并按这个秒数等待；超时**只跳过 B 流**（A 照常跑），不整轮失败。
+# 设 0 = 不等待（适合无人值守；但仍会打印告警）。
+LOGIN_WAIT_SECONDS = max(0.0, float(_first_env("LOGIN_WAIT_SECONDS", default="180") or 180))
+
+# 默认端口/profile 约定：A 用 9222 + 现有目录（兼容历史），B 用 9223 + 新目录。
+_BROWSER_DEFAULTS = {
+    "A": {"port": 9222, "profile": "./chrome_debug_profile", "delay": 0.0},
+    "B": {"port": 9223, "profile": "./chrome_debug_profile_b", "delay": 8.0},
+}
+
+
+def _build_browser_profiles() -> list:
+    """按 NUM_STREAMS 产出 BrowserProfile 列表（A 是主浏览器，B 是代理浏览器）。
+
+    几个刻意为之的点：
+      · **只有单浏览器模式才允许复用邻近端口**（`reuse_nearby = NUM_STREAMS == 1`）。
+        ensure_chrome_running 在目标端口不是 DevTools 时会扫邻近端口找"已在跑的调试浏览器"
+        并复用；单流时这是便利，**多流时等于抢另一条流的浏览器** ——
+        实测 2026-09-18：A 的浏览器中途退出后，A 回退时抓走了 B 的浏览器，
+        两条流从此共用一台（代理/账号/IP 全废），日志里只有一行不显眼的 ♻️。
+      · **翻页车道错开**：A 扫 1/3/5…、B 扫 2/4/6…（同一关键词互不重复扫页）。
+        单流时 stride=1、offset=1，行为与改造前完全一致。
+      · **补全顺序错开**：A 先天眼查→后爱企查，B 先爱企查→后天眼查。
+        两条流若同序，会几乎同时进入爱企查并**同时弹验证码**（实测），
+        两个浏览器窗口抢焦点、人工过码很难受。错开后任一时刻只有一条流在爱企查。
+      · 端口自动递推：不显式配置时 B 取 A 的端口 + 1，避免两台撞同一个 CDP 端口。
+    """
+    from core.browser import BrowserProfile   # 延迟导入：避免 config <-> core 循环依赖
+
+    letters = ["A", "B", "C", "D"][:NUM_STREAMS]
+    stride = NUM_STREAMS if NUM_STREAMS > 1 else 1
+    # 多流才需要"抢"浏览器，所以复用便利只在单流保留
+    allow_reuse = (NUM_STREAMS == 1)
+    out: list = []
+    for idx, letter in enumerate(letters):
+        d = _BROWSER_DEFAULTS.get(letter, {"port": 9222 + idx,
+                                           "profile": f"./chrome_debug_profile_{letter.lower()}",
+                                           "delay": 8.0})
+        try:
+            port = int(_first_env(f"BROWSER_{letter}_PORT", default=str(d["port"])) or d["port"])
+        except ValueError:
+            port = d["port"]
+        profile = _first_env(f"BROWSER_{letter}_PROFILE", default=d["profile"]) or d["profile"]
+        proxy = _first_env(f"BROWSER_{letter}_PROXY", default="") or None
+        try:
+            delay = float(_first_env(f"BROWSER_{letter}_START_DELAY", default=str(d["delay"]))
+                          or d["delay"])
+        except ValueError:
+            delay = d["delay"]
+        # 补全顺序：偶数号（A/C）先天眼查，奇数号（B/D）先爱企查 —— 相邻两条流永远错开
+        default_priority = "tianyancha" if idx % 2 == 0 else "aiqicha"
+        priority = (_first_env(f"BROWSER_{letter}_ENRICH_PRIORITY", default=default_priority)
+                    or default_priority).strip().lower()
+        if priority not in ("tianyancha", "aiqicha"):
+            priority = default_priority
+        out.append(BrowserProfile(
+            name=letter,
+            port=port,
+            profile_dir=profile,
+            proxy=proxy,
+            enabled=True,
+            is_primary=(idx == 0),
+            reuse_nearby=allow_reuse,
+            start_delay=max(0.0, delay),
+            lane_offset=idx + 1,
+            lane_stride=stride,
+            enrich_priority=priority,
+        ))
+    return out
+
+
+BROWSER_PROFILES: list = _build_browser_profiles()
+
+
+def browser_status() -> str:
+    """启动横幅用的一行摘要（只暴露端口/profile/是否走代理，不含账号信息）。"""
+    if len(BROWSER_PROFILES) <= 1:
+        p = BROWSER_PROFILES[0]
+        return (f"单浏览器（{p.name}）｜CDP 端口 {p.port}｜profile {p.profile_dir}｜"
+                f"{'代理 ' + p.proxy if p.proxy else '本机直连'}")
+    parts = []
+    _PRIO = {"tianyancha": "天眼查先", "aiqicha": "爱企查先"}
+    for p in BROWSER_PROFILES:
+        parts.append(f"{p.name}: 端口{p.port}/{p.profile_dir}/"
+                     f"{('代理 ' + p.proxy) if p.proxy else '本机直连'}"
+                     f"/扫第{p.lane_offset},{p.lane_offset + p.lane_stride},…页"
+                     f"/补全{_PRIO.get(p.enrich_priority, p.enrich_priority)}")
+    return f"双浏览器并行（共 {len(BROWSER_PROFILES)} 台）｜" + "｜".join(parts)
 
 
 if not OPENAI_API_KEY:  # 一次性告警：避免"静默降级"被误当成质检正常

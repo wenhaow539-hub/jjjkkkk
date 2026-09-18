@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import random
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import re
 
@@ -8,7 +10,7 @@ import pandas as pd
 from playwright.async_api import async_playwright
 
 import config
-from core.browser import ensure_chrome_running
+from core.browser import BrowserProfile, ensure_chrome_running
 from core.factory import CrawlerFactory
 import crawlers
 from enrichers.aiqicha import AiQiChaEnricher
@@ -18,9 +20,33 @@ from enrichers.website import WebsiteEnricher
 from exporters.excel import export_leads_to_excel
 from models import RawSupplierLead
 from utils.dedup import commit_lead_fingerprints, rollback_fingerprints
-from utils.logger import get_logger
+from utils.logger import STREAM_TAG, get_logger, stream_context
 
 logger = get_logger("pipeline")
+
+
+@dataclass
+class StreamContext:
+    """一条流水线的「流上下文」——双浏览器并行时两条流各持一份。
+
+    存在的意义是让 `run_pipeline` 的**业务逻辑一行不改**：单流时它是 None
+    （走与改造前完全相同的代码路径），双流时只在这里注入差异。
+
+    共享的东西（excel_lock）由外壳建好传进来；每流独有的东西（tag / profile）各自一份。
+    """
+
+    tag: str                                   # "A" / "B"，用于日志前缀
+    profile: BrowserProfile | None = None      # 本流用哪台浏览器
+    excel_lock: asyncio.Lock | None = None     # ⚠️ 两条流共享同一把
+    do_legacy_recheck: bool = True             # 存量报表复核只让一条流做
+
+    def lock(self):
+        """落盘用的锁。单流（无 lock）时返回 nullcontext，行为不变。"""
+        return self.excel_lock if self.excel_lock is not None else contextlib.nullcontext()
+
+    @property
+    def name(self) -> str:
+        return self.profile.name if self.profile else self.tag
 
 # —— 工商补全数据源 ——
 # aiqicha    : 爱企查（默认）
@@ -483,6 +509,18 @@ def _split_alternating(items: list) -> tuple[list, list]:
     return list(items[0::2]), list(items[1::2])
 
 
+def _passes_remaining(passes: list, current_name: str) -> bool:
+    """当前趟之后，`passes` 里是否还有**别的数据源**没跑。
+
+    用途：熔断时判断"该不该彻底停"。hybrid 两趟（天眼查 / 爱企查）是**互相独立**的
+    数据源，一趟被反爬拦下不该连坐另一趟 —— 详见 `_enrich_business` 里的踩坑注释。
+    """
+    names = [n for n, _ in passes]
+    if current_name not in names:
+        return False
+    return any(n != current_name for n in names[names.index(current_name) + 1:])
+
+
 async def _enrich_business(
     needing: list,
     source: str,
@@ -493,6 +531,7 @@ async def _enrich_business(
     captcha_mode: str = "auto",
     captcha_provider: str | None = None,
     captcha_wait: float | None = None,
+    priority_source: str | None = None,
 ) -> dict:
     """按数据源逐家补全工商数据（节流 + 熔断）。
 
@@ -500,7 +539,12 @@ async def _enrich_business(
     - source="tianyancha" ：只跑天眼查（改动前行为）
     - source="both"       ：先爱企查，关键字段仍缺失的再用天眼查兜底
     熔断：连续 `fuse` 家环境异常（验证码超时/被拦/请求异常）→ 中止剩余补全，
-    但只记录错误、不抛异常，让已采数据继续落盘。
+    但只记录异常、不抛异常，让已采数据继续落盘。
+
+    priority_source：hybrid 模式下**先跑哪一家**（"tianyancha" / "aiqicha"）。
+        双流并行时两条流要**用不同顺序**，否则它们会几乎同时进入爱企查、
+        **同时弹验证码**（实测 2026-09-18：两个浏览器窗口一起弹图形验证码，
+        人工过码时两个窗口互相抢焦点）。错开后任一时刻只有一条流在爱企查。
 
     验证码口径（captcha_mode，仅对爱企查生效）：
         auto   —— 先用打码平台自动识别（需 .env 配置），失败再人工等待 captcha_wait 秒
@@ -520,19 +564,35 @@ async def _enrich_business(
         # 按家**交替**分派：第 1 家→天眼查，第 2 家→爱企查，第 3 家→天眼查…
         # 为什么交替而不是"前后各半"：GS 列表页前排的商户通常更活跃，前后切开会让
         # 两家拿到的样本不等价；交替则最均衡。
-        # 天眼查那批先跑（用户口径），两家**串行**：它们共用同一个 CDP 浏览器，
-        # 天眼查命中验证码时要 bring_to_front 抢焦点，并行会互相打断验证码流程。
+        # 两家**串行**（同一浏览器内，天眼查命中验证码时要 bring_to_front 抢焦点）。
+        #
+        # 顺序由 `priority_source` 决定：两条流用相反顺序，避免同时挤在爱企查上。
         tyc_recs, aiqc_recs = _split_alternating(needing)
-        passes.append(("tianyancha", tyc_recs))
-        passes.append(("aiqicha", aiqc_recs))
+        aiqicha_first = (priority_source == "aiqicha")
+        if aiqicha_first:
+            passes.append(("aiqicha", aiqc_recs))
+            passes.append(("tianyancha", tyc_recs))
+        else:
+            passes.append(("tianyancha", tyc_recs))
+            passes.append(("aiqicha", aiqc_recs))
         logger.info(f"      🔀 [分流] 本批 {len(needing)} 家按家交替分配："
-                    f"天眼查 {len(tyc_recs)} 家 → 爱企查 {len(aiqc_recs)} 家（串行执行）")
+                    f"天眼查 {len(tyc_recs)} 家 / 爱企查 {len(aiqc_recs)} 家（串行执行）"
+                    f"｜本流顺序：{'爱企查 → 天眼查' if aiqicha_first else '天眼查 → 爱企查'}"
+                    f"{'（与另一条流相反，避免同时弹验证码）' if priority_source else ''}")
     else:  # 默认 aiqicha
         passes.append(("aiqicha", needing))
 
     for name, recs in passes:
-        if stats["aborted"]:
-            break
+        # ⚠️ 这里**绝不能读 `stats["aborted"]` 来决定要不要跑下一趟**：
+        #    hybrid 模式是「两趟串行」——爱企查趟熔断了，天眼查那趟**仍应照跑**
+        #    （两源独立，一个被反爬拦下不构成另一个也挂了的理由）。
+        #    实测踩坑（2026-09-18）：B 流批 5 爱企查连撞 3 次 ERR_EMPTY_RESPONSE 熔断，
+        #    旧的 `break` 直接把天眼查那 12 家也跳过了 → 24 家里 18 家工商字段全空入库。
+        #    所以熔断只中止**当前趟**（本趟局部的 `abort_this_pass`），剩下的趟继续跑，
+        #    各趟熔断计数独立。`stats["aborted"]` 只是**全局**标记（供上层提示"本批有趟熔断了"）。
+        #    ⚠️ 第一版修复写成 `if stats["aborted"] and not _passes_remaining(...)`：逻辑反了，
+        #       上一趟置 True 后下一趟照旧被拦 —— 被测试 U3 当场顶回，别再犯。
+        abort_this_pass = False
 
         if recs is not None and not recs:
             logger.info(f"      ↩️ [分流] {ENRICH_SOURCE_LABELS.get(name, name)} 本次没有分到商户，跳过")
@@ -594,16 +654,85 @@ async def _enrich_business(
 
             if consecutive_failed >= fuse:
                 stats["aborted"] = True
+                abort_this_pass = True
                 stats["skipped"] += len(recs) - idx
                 logger.error(
                     f"      🛑 [熔断] 连续 {consecutive_failed} 家{label}环境异常（验证码/反爬/请求失败），"
-                    f"已中止剩余 {len(recs) - idx} 家补全。\n"
-                    f"         处置建议：在对应的 Chrome 窗口中人工过验证码后重跑，"
-                    f"或改用其它浏览器环境（--cdp-url）。已采集的数据仍会正常落盘。"
+                    f"已中止本趟剩余 {len(recs) - idx} 家补全。"
+                    + (f"\n         本趟中止**不影响**另一数据源："
+                       f"{_passes_remaining(passes, name) and '后面还有一趟会继续跑' or '已是最后一趟'}。"
+                       if len(passes) > 1 else "")
+                    + f"\n         处置建议：在对应的 Chrome 窗口中人工过验证码后重跑，"
+                      f"或改用其它浏览器环境（--cdp-url）。已采集的数据仍会正常落盘。"
                 )
                 break
 
+        if abort_this_pass:
+            logger.warning(
+                f"      ⏭️ [{label}] 本趟熔断中止；"
+                f"未处理的家**未执行补全**，将按原策略保留入库（不算「查不到」）。"
+            )
+
     return stats
+
+
+# —— 浏览器"中途死掉"的判据 ——
+# 触发场景（实测 2026-09-18）：Chrome 窗口被关 / 进程崩溃 / 被系统回收 → 正在跑的
+# `page.goto` 立刻抛 TargetClosedError。异常类型名 + 消息文本双判据，因为 Playwright
+# 在不同版本里抛的类名不一致（`TargetClosedError` / `Error`），只认类型会漏。
+_BROWSER_DEATH_HINTS = (
+    "TargetClosedError",
+    "Target page, context or browser has been closed",
+    "Browser has been closed",
+    "browser has been closed",
+    "Target closed",
+)
+
+
+def _looks_like_browser_death(err: BaseException) -> bool:
+    """这个异常是不是"浏览器没了"（而不是页面结构变了/网络抖动之类的业务失败）。"""
+    if type(err).__name__ in ("TargetClosedError", "BrowserClosedError"):
+        return True
+    msg = str(err)
+    return any(h in msg for h in _BROWSER_DEATH_HINTS)
+
+
+async def _scrape_with_selfheal(crawler, *, keyword: str, max_count: int, batch_no: int):
+    """采集这一批；若因**浏览器中途死掉**失败，重拉本流浏览器后重试一次。
+
+    为什么需要它（补的是哪一段）：批次边界本来就会 `ensure_chrome_running`（浏览器没了
+    会自动重拉），所以"上一批结束之后才死"已能自愈。真正没兜住的是「**采集中途**死掉」——
+    那时异常直接冒出去，`run_pipeline` 没有批次级 try，异常一路到 `run_dual_pipeline`
+    的 `gather`，结果是**这条流整条结束**：剩下的批次全不跑，而日志上只有一行流结束汇总。
+
+    重拉是安全的：多流模式下 `reuse_nearby=False` + 端口归属校验，决定了
+    `ensure_chrome_running` 只会拉起**自己的**浏览器，绝不会去抢另一条流的那台
+    （这正是上一次事故的根因，已单独修掉）。
+
+    ⚠️ 一个消除不掉的副作用，必须说清楚：重试会**重扫一次列表页**，
+    已被写到指纹库的候选会被 `dedup` 挡住（不会重复入库），但"**崩溃前已写指纹、
+    还没返回给上游的那些家**"本批就捞不回来了 —— 它们的指纹还在，所以下一轮也不会再采到。
+    要彻底避免只能靠缩小批次（--batch-size 调小 → 单批暴露面更小）。
+    """
+    try:
+        return await crawler.scrape(keyword=keyword, max_count=max_count)
+    except Exception as e:
+        if not _looks_like_browser_death(e):
+            # 不是浏览器的问题（页面结构变了、解析异常…）→ 重试没有意义，原样抛出。
+            raise
+        logger.error(
+            f"\n🚨 [自愈] 第 {batch_no} 批采集中途**浏览器被关闭**：{type(e).__name__}\n"
+            f"   现象：该流自己的 Chrome 已消失（窗口被关 / 崩溃 / 被系统回收）。\n"
+            f"   处置：自动重新拉起本流浏览器（端口 {getattr(crawler, 'cdp_port', '?')}、"
+            f"profile {getattr(crawler, 'profile_dir', '?')}）并重试本批一次。\n"
+            f"   注意：重试会重扫一遍列表页；崩溃前已写指纹、尚未返回的候选本批捞不回来。"
+        )
+        # 重拉（多流下只会重拉自己的；若端口已归属别的流会抛错 —— 那是有意为之，
+        # 宁可中止这条流也不静默共用另一条流的浏览器）。返回值会写回 crawler.cdp_port。
+        crawler.ensure_chrome_running()
+        logger.info(f"   ♻️ [自愈] 浏览器已就绪（端口 {getattr(crawler, 'cdp_port', '?')}），"
+                    f"重试第 {batch_no} 批采集…")
+        return await crawler.scrape(keyword=keyword, max_count=max_count)
 
 
 async def _prepare_batch(
@@ -626,7 +755,12 @@ async def _prepare_batch(
     `scrape_count` 是**本批的采集上限**，不一定是 `--batch-size`：
     末批只差几家时上游会传差额（避免整批采满导致超采，实测目标 60 结果入了 84）。
     """
-    fresh_leads: list[RawSupplierLead] = await crawler.scrape(keyword=keyword, max_count=scrape_count)
+    # 走自愈包装：**采集中途浏览器被关掉**时会重拉本流浏览器并重试一次，
+    # 而不是让异常冒出去把这条流整条结束掉（见 _scrape_with_selfheal）。
+    # 本函数其余部分（独立站 httpx / LLM）不碰浏览器，所以自愈点只需要包这一句。
+    fresh_leads: list[RawSupplierLead] = await _scrape_with_selfheal(
+        crawler, keyword=keyword, max_count=scrape_count, batch_no=batch_no,
+    )
 
     # 1.5 「环球资源没爬到中文名 → 重爬一次 → 仍无则剔除」
     # crawler 内部已经同轮重试过一次（含冷却），到这里仍没有中文名的就是确认取不到的。
@@ -721,6 +855,7 @@ async def _finish_batch(
     captcha_wait: float | None,
     drop_missing_name: bool,
     batch_no: int,
+    stream_ctx: StreamContext | None = None,
 ) -> int:
     """**重活**：两家工商补全 → 工商全空剔除 → 存量复核 → 落盘 → 兜底写指纹。
 
@@ -751,7 +886,35 @@ async def _finish_batch(
             if origin_count.get("LLM译名"):
                 logger.warning(f"      ⚠️ 有 {origin_count['LLM译名']} 家没有 GS 中文工商名，"
                                f"只能用大模型译名去查，命中率可能偏低")
-            ensure_chrome_running(port=crawler.cdp_port, platform_name=source_label)
+            # ⚠️ 必须把 profile_dir / reuse_nearby 一起传下去。
+            # 原来只传了 port，于是这里永远退回默认目录 `./chrome_debug_profile`：
+            # 双浏览器时浏览器 B 的补全阶段会拿错 profile（甚至把 A 的浏览器拉起来），
+            # 表现为「B 用了 A 的登录态」且**不报任何错**。
+            #
+            # owner=crawler.stream_tag：端口归属校验。若这条流的浏览器已死、回退时
+            # 抓到另一条流的端口，这里会**直接抛错中止该流**，而不是让两条流悄悄共用一台。
+            _before_port = crawler.cdp_port
+            # ⚠️⚠️ 必须**接住返回值并回写** `crawler.cdp_port`。
+            # `ensure_chrome_running` 返回的是**实际使用的端口**，它可能在两种情况下不同于入参：
+            #   ① 该流的浏览器已死，重新拉起时因原端口被别的程序占着而改用了别的端口；
+            #   ② 原端口被非 DevTools 进程占用 → find_available_port 另找一个。
+            # 不回写的后果是下面 `connect_over_cdp` 仍然去连**旧端口**（那儿已经没有浏览器了），
+            # 补全整批失败 —— 而且 `if crawler.cdp_port != _before_port` 恒为 False，
+            # 连"端口变了"这行唯一的现场信号都不会打印（这里曾经就是死代码）。
+            crawler.cdp_port = ensure_chrome_running(
+                port=crawler.cdp_port, platform_name=source_label,
+                profile_dir=crawler.profile_dir,
+                proxy=crawler.proxy,
+                reuse_nearby=crawler.reuse_nearby,
+                owner=getattr(crawler, "stream_tag", None) or None,
+            )
+            if crawler.cdp_port != _before_port:
+                logger.error(
+                    f"🚨 [补全阶段] 调试端口由 {_before_port} 变为 {crawler.cdp_port}："
+                    f"该流自己的浏览器已经没了（窗口被关 / 崩溃 / 端口被抢），"
+                    f"已在 {crawler.cdp_port} 上重新拉起并继续。"
+                    f"若这行**不是你预期的**，请检查 Chrome 崩溃记录或内存占用。"
+                )
 
             async with async_playwright() as p:
                 browser = None
@@ -776,6 +939,9 @@ async def _finish_batch(
                             captcha_mode=mode,
                             captcha_provider=captcha_provider,
                             captcha_wait=captcha_wait,
+                            # 双流用相反的补全顺序，避免两条流同时挤在爱企查上弹验证码
+                            priority_source=(stream_ctx.profile.enrich_priority
+                                             if stream_ctx and stream_ctx.profile else None),
                         )
                         logger.info(
                             f"      📊 [工商补全] 完成: 成功 {stats['ok']} | 查无此企业 {stats['not_found']} | "
@@ -817,9 +983,14 @@ async def _finish_batch(
     # 5. 存量报表里「无中文名」的历史行：重爬一次，仍取不到则删除
     # ⚠️ 只在**第 1 批**做：它是"全量扫报表 + 逐条重抓"，分批跑多次等于把同一批历史行
     #    白抓多遍（清理不掉的会一直留在表里，每批都被重新抓到）。
+    # 双浏览器时再收紧一层：**只有主浏览器那条流做**。两条流都做等于把同一批历史行
+    # 在两张浏览器里各抓一遍，而结果（drop_urls）还是同一份，纯浪费。
     drop_urls: set[str] = set()
-    if drop_missing_name and batch_no == 1:
+    _may_recheck = (stream_ctx is None or stream_ctx.do_legacy_recheck)
+    if drop_missing_name and batch_no == 1 and _may_recheck:
         drop_urls = await _recheck_legacy_missing_name(crawler, output_file)
+    elif drop_missing_name and batch_no == 1 and not _may_recheck:
+        logger.info("      ℹ️ 存量报表复核已交给另一条流执行，本流跳过（避免同一批历史行被抓两遍）")
 
     # 6. 落盘报表导出
     leads_data = [RawSupplierLead(**rec["lead"]) for rec in records.values()]
@@ -836,15 +1007,24 @@ async def _finish_batch(
 
     export_stats: dict = {}
     try:
-        export_leads_to_excel(
-            leads_data=leads_data,
-            enriched_results=enriched_results,
-            eval_results=eval_results,
-            keyword=keyword,
-            output_file=output_file,
-            drop_urls=drop_urls,
-            stats=export_stats,
-        )
+        # ⚠️ 落盘必须串行化：`export_leads_to_excel` 是**读整表 → 合并 → 去重 → 写回**，
+        #    两条流并发调用会产生 read-modify-write 竞态 —— 后写的把先写的那批行整段覆盖掉，
+        #    报表**静默丢行**。加锁后同一时刻只有一条流在重写 xlsx。
+        #    第二次开双流时才会暴露这个 bug（单流时锁是 nullcontext，行为不变）。
+        #
+        # 用 to_thread 是因为它是同步的 pandas 读写：直接 await 会堵住事件循环，
+        # 让另一条流的补全冷却/验证码计时整体停摆（白白拖慢双流）。
+        async with (stream_ctx.lock() if stream_ctx else contextlib.nullcontext()):
+            await asyncio.to_thread(
+                export_leads_to_excel,
+                leads_data=leads_data,
+                enriched_results=enriched_results,
+                eval_results=eval_results,
+                keyword=keyword,
+                output_file=output_file,
+                drop_urls=drop_urls,
+                stats=export_stats,
+            )
     except Exception as e:
         # ⚠️ 「候选即写」带来的新风险：指纹已经在采集阶段写下了，但报表**没落盘** ⇒
         #    这批等于"处理过却没进报表"。必须把指纹撤掉，否则下次（以及以后每次）
@@ -887,6 +1067,8 @@ async def run_pipeline(
     batch_size: int = 30,
     reset_pages: bool = False,
     async_prefetch: bool = True,
+    stream_ctx: StreamContext | None = None,
+    profile: BrowserProfile | None = None,
 ):
     """分批采集 → 批内分流两家 → 每批入库，直到**累计入库**达到目标。
 
@@ -903,7 +1085,21 @@ async def run_pipeline(
     重新采到、再占一次名额。为此设了「连续 2 批零新增就停」的兜底，避免空转。
 
     分批的额外好处：每批查完立刻入库 + 写指纹，中断时前面的批次成果不会丢。
+
+    stream_ctx / profile：**双浏览器并行**时才传（见 `run_dual_pipeline`）。
+    默认全为 None ⇒ 单流，代码路径与改造前逐字节一致（锁退化为空、无日志前缀、
+    浏览器用 config 里的第一个 profile）。
     """
+    if profile is None and config.BROWSER_PROFILES:
+        # 单流：用第一个 profile（默认仍是 9222 + ./chrome_debug_profile，与历史一致）
+        profile = config.BROWSER_PROFILES[0]
+    if stream_ctx is None and profile is not None and profile.lane_stride > 1:
+        # ⚠️ 车道只在「确实有另一条流在跑」时才成立。
+        #    直接调 run_pipeline（单流）却沿用 A 的 lane_stride=2 的话，只会扫第 1、3、5… 页，
+        #    **偶数页无人负责 → 漏采**（不会报错，只是采得少，很难发现）。
+        #    这里把车道还原成"全页"，让单流语义与改造前完全一致。
+        profile = replace(profile, lane_offset=1, lane_stride=1)
+
     total_count = max(1, int(max_count or 1))
     batch_size = max(1, int(batch_size or 1))
     plan_batches = (total_count + batch_size - 1) // batch_size
@@ -948,17 +1144,44 @@ async def run_pipeline(
     logger.info(f"⚡ 异步预取: {'开（下一批的采集/独立站/LLM 与本批工商补全并行）' if async_prefetch else '关（严格串行）'}")
     logger.info("=======================================================")
 
+    # —— 给本协程打上流标识（双浏览器并行时日志会交错，靠这个区分是哪一台）——
+    # ⚠️ 只设不复位：`run_dual_pipeline` 用 asyncio.gather 起两条流，gather 会把每个协程
+    #    包成独立 Task，而 Task 运行在**上下文副本**里 —— 在这里 set 不会污染外层，
+    #    也不会串到另一条流。单流（stream_ctx=None）时压根不设，输出与改造前一致。
+    if stream_ctx is not None:
+        stream_context(stream_ctx.tag)
+
+    if profile is not None and len(config.BROWSER_PROFILES) > 1:
+        logger.info(f"🖥️ 本流使用浏览器 {profile.name}｜CDP 端口 {profile.port}｜"
+                    f"profile {profile.profile_dir}｜"
+                    f"{'代理 ' + profile.proxy if profile.proxy else '本机直连'}")
+
     logger.info(f"🧹 入库门槛: " + (
         "要求「GS 有中文工商名」且「工商库能查到信息」，不满足即剔除"
         if drop_missing_name else "不设门槛，全部入库（--keep-missing-name）"))
 
-    crawler = CrawlerFactory.get_crawler(platform)
+    crawler = CrawlerFactory.get_crawler(
+        platform,
+        cdp_port=profile.port,
+        profile_dir=profile.profile_dir,
+        proxy=profile.proxy,
+        reuse_nearby=profile.reuse_nearby,
+        stream_tag=profile.name,
+        lane_offset=profile.lane_offset,
+        lane_stride=profile.lane_stride,
+    )
     if reset_pages and hasattr(crawler, "reset_page_cursor"):
         cleared = crawler.reset_page_cursor()
         logger.info(f"📑 [翻页进度] 已按要求重置（清掉 {cleared} 条）→ 本批从第 1 页重新扫")
     elif plan_batches > 1 and hasattr(crawler, "reset_page_cursor"):
-        logger.info("📑 翻页进度在批次间**承接**：第 2 批起从上次停下的页继续，不重扫前面的页。"
-                    "代价：靠前页上被剔除的家不再重试（要重扫加 --reset-pages）")
+        if profile.lane_stride > 1:
+            logger.info(f"📑 本流负责**车道** 第 {profile.lane_offset}、"
+                        f"{profile.lane_offset + profile.lane_stride}、… 页（步长 {profile.lane_stride}），"
+                        f"与另一条流扫的页**不相交**；批次间承接本车道进度。"
+                        f"要重扫本车道请加 --reset-pages")
+        else:
+            logger.info("📑 翻页进度在批次间**承接**：第 2 批起从上次停下的页继续，不重扫前面的页。"
+                        "代价：靠前页上被剔除的家不再重试（要重扫加 --reset-pages）")
 
     ingested = 0
     batch_no = 0
@@ -1063,6 +1286,7 @@ async def run_pipeline(
             captcha_wait=captcha_wait,
             drop_missing_name=drop_missing_name,
             batch_no=batch_no,
+            stream_ctx=stream_ctx,
         )
         ingested += added
         logger.info(f"📦 [批次 {batch_no}] 结束：本批真正新增入库 {added} 家，累计 {ingested}/{total_count}")
@@ -1099,7 +1323,14 @@ async def run_pipeline(
             if empty_streak >= 2:
                 logger.warning(
                     f"\n⛔ [Pipeline] 连续 {empty_streak} 批零新增，停止补批。\n"
-                    f"   最可能的原因：候选池里剩下的都是「已在报表里」或「采到就被剔除」的家"
+                    f"   ⚠️ 先排查这一条（最容易误判）：**GS 翻页撞了上限**"
+                    f"（`GS_MAX_SEARCH_PAGES`，当前 {config.GS_MAX_SEARCH_PAGES} 页）。\n"
+                    f"      判据：在上面日志里搜「已翻到翻页上限」—— 命中就是它："
+                    f"池子还在后面，只是代码不往下翻了。\n"
+                    f"      处置：把 .env 的 `GS_MAX_SEARCH_PAGES` 调大后重跑（不用 --reset-pages，"
+                    f"游标会从断点继续）。实测 2026-09-18：`phone+广东` 有 62 页，"
+                    f"写死的 25 页只覆盖了六成，26 页之后从没被扫过。\n"
+                    f"   其它可能：候选池里剩下的都是「已在报表里」或「采到就被剔除」的家"
                     f"（被剔除的家进了指纹库又回滚，会被反复采到）。\n"
                     f"   可尝试：换关键词 / 换地区 / 查看是不是两家都在触发验证码。"
                 )
@@ -1138,6 +1369,168 @@ async def run_pipeline(
     else:
         logger.info(f"🏁 [Pipeline] 提前结束：累计入库 {ingested}/{total_count} 家（共 {batch_no} 批，"
                     f"各批采集上限合计 {scraped_total} 家候选）")
+    logger.info(f"💾 报表: {output_file}")
+    logger.info("=" * 62)
+
+
+# =========================================================================== #
+# 双浏览器并行（单进程内）
+# =========================================================================== #
+async def run_dual_pipeline(
+    keyword: str = "monitor",
+    platform: str = "globalsources",
+    max_count: int = 5,
+    output_file: str = "suppliers_leads.xlsx",
+    profiles: list | None = None,
+    **common,
+) -> None:
+    """在**一个进程里并行跑两条完整流水线**，每条用一台自己的 Chrome。
+
+    为什么这样拆：`run_pipeline` 的逻辑一行都不用改，双流的差异全部收敛在这里
+    （浏览器配置 + 共享落盘锁 + 日志前缀 + 存量复核归属）。单流时这个函数直接
+    降级为一次普通的 `run_pipeline`，行为与改造前一致。
+
+    ⚠️ `max_count` 是**每条流各自**的目标（用户口径）：`-n 120` → 两条流各入库 120，
+    合计约 240。想只要 120 总量就把 `-n` 设成 60。
+
+    两条流共享的东西只有一件事：**报表落盘锁**。因为 `export_leads_to_excel` 是
+    「读整表 → 合并 → 去重 → 写回」，两条流并发调用会互相覆盖、静默丢行。
+    指纹库（`dedup` 单例）在单进程内是线程/协程安全的，两流共享反而能防重复采集。
+    """
+    profiles = profiles if profiles is not None else list(config.BROWSER_PROFILES)
+    profiles = [p for p in profiles if p and getattr(p, "enabled", True)]
+
+    if len(profiles) <= 1:
+        logger.info("ℹ️ 只配置了 1 台浏览器 → 按**单流**执行（要并行请设 NUM_STREAMS=2）")
+        return await run_pipeline(
+            keyword=keyword, platform=platform, max_count=max_count,
+            output_file=output_file, **common,
+        )
+
+    # —— 启动前检查登录态 ——
+    # 浏览器 B 的 profile 是全新的（登录态跟随 --user-data-dir），没有登录标记就跑，
+    # 天眼查/爱企查会全线失败，而且失败形态是"查无此企业/拿不到字段" —— 很容易被
+    # 误判成数据问题。所以没登录的家先提示 + 等一会儿，仍不行就**只跳过它**。
+    from utils.browser_setup import is_logged_in, marker_summary, wait_for_login
+
+    ready: list = []
+    for p in profiles:
+        if is_logged_in(p):
+            ready.append(p)
+            continue
+        if await wait_for_login(p, config.LOGIN_WAIT_SECONDS):
+            ready.append(p)
+        else:
+            logger.warning(f"⚠️ [双浏览器] 因未登录，本次跳过浏览器 {p.name}（其余继续跑）")
+    if not ready:
+        logger.error("❌ [双浏览器] 没有任何一台浏览器可用（都未登录）→ 退回单流。"
+                     "请先跑 `python main.py --login-browser B`。")
+        return await run_pipeline(
+            keyword=keyword, platform=platform, max_count=max_count,
+            output_file=output_file, **common,
+        )
+    profiles = ready
+
+    total = len(profiles)
+    logger.info("=" * 62)
+    logger.info(f"🖥️🖥️ [双浏览器并行] 启动 {total} 条流水线（每条各自入库 {max_count} 家，"
+                f"合计约 {max_count * total} 家）")
+
+    # —— 顺序预启动两台浏览器（**必须在起流之前，且串行**）——
+    # 两个理由：
+    #  ① 消除并发抢占端口的竞态。`ensure_chrome_running` 在目标端口被非 DevTools 占用时
+    #     会 `find_available_port` 另找一个空闲端口；两条流同时做这件事，完全可能**抢到
+    #     同一个**空端口 → 第二台启动失败或两台连到同一台上，而日志里看不出异常。
+    #  ② 能在开工前就确认"两台确实落在不同端口"。若两台落到同一个 CDP 端口，就是
+    #     **双流退化成共用一台浏览器**（代理配置、账号、IP 全部失效），必须立刻报出来 ——
+    #     这种退化以前只会在数据上表现为"没什么提升"，极难察觉。
+    resolved: list = []
+    for p in profiles:
+        rp = ensure_chrome_running(
+            port=p.port, profile_dir=p.profile_dir,
+            platform_name=f"预启动({p.name})",
+            proxy=p.proxy, reuse_nearby=p.reuse_nearby,
+        )
+        if rp != p.port:
+            logger.warning(f"   ⚠️ 浏览器 {p.name} 请求端口 {p.port} 被占用 → 实际使用 {rp}")
+        resolved.append(replace(p, port=rp))
+    profiles = resolved
+
+    _port_map: dict = {}
+    for p in profiles:
+        _port_map.setdefault(p.port, []).append(p.name)
+    _clash = {port: names for port, names in _port_map.items() if len(names) > 1}
+    if _clash:
+        logger.error(
+            f"   ❌ 有两台浏览器落在**同一个 CDP 端口** {_clash} → 双流会退化成共用一台浏览器"
+            f"（代理、账号、IP 全部失效）。\n"
+            f"      处置：在 .env 里给它们配不同的 BROWSER_*_PORT，或关掉另一台已占端口的浏览器后重跑。"
+        )
+        return
+
+    for p in profiles:
+        _prio = "爱企查 → 天眼查" if p.enrich_priority == "aiqicha" else "天眼查 → 爱企查"
+        logger.info(f"   · 浏览器 {p.name}: 端口 {p.port}｜profile {p.profile_dir}｜"
+                    f"{('代理 ' + p.proxy) if p.proxy else '本机直连'}｜"
+                    f"扫第 {p.lane_offset}、{p.lane_offset + p.lane_stride}、… 页｜"
+                    f"补全顺序 {_prio}"
+                    f"{f'｜延迟 {p.start_delay:.0f}s 启动' if p.start_delay else ''}")
+        logger.info(f"       登录态: {marker_summary(p)}")
+    _prios = {p.enrich_priority for p in profiles}
+    if len(profiles) > 1 and len(_prios) > 1:
+        logger.info("   ✅ 两条流的补全顺序**相反** → 任一时刻只有一条流在访问爱企查，"
+                    "不会同时弹验证码")
+    elif len(profiles) > 1:
+        logger.warning("   ⚠️ 两条流的补全顺序**相同** → 它们会几乎同时进入爱企查、"
+                       "可能同时弹验证码。可在 .env 里给其中一台设 "
+                       "`BROWSER_B_ENRICH_PRIORITY=aiqicha` 来错开")
+    if not any(p.proxy for p in profiles):
+        logger.warning("   ⚠️ 没有任何一台配了代理（BROWSER_B_PROXY 为空）→ 两台都用本机 IP。"
+                       "双流仍能跑，但**没有分摊出口 IP 的风控风险**。拿到代理后填进 .env 即可。")
+    logger.info("=" * 62)
+
+    # ⚠️ 两流共享同一把落盘锁（见函数文档）
+    excel_lock = asyncio.Lock()
+
+    async def _run_one(idx: int, prof: BrowserProfile) -> None:
+        if prof.start_delay > 0:
+            # 错峰启动：错开两台首次翻页/验证码爆发的时间点。
+            # 手动过码时尤其有用 —— 两个窗口同时弹验证码会互相抢焦点。
+            logger.info(f"   ⏳ 浏览器 {prof.name} 延迟 {prof.start_delay:.0f}s 启动（错峰）")
+            await asyncio.sleep(prof.start_delay)
+        ctx = StreamContext(
+            tag=prof.name,
+            profile=prof,
+            excel_lock=excel_lock,
+            # 存量报表复核只让第一条流做：它是"全量扫表 + 逐条重抓"，
+            # 两条流都做等于把同一批历史行抓两遍，而 drop_urls 还是同一份。
+            do_legacy_recheck=(idx == 0),
+        )
+        await run_pipeline(
+            keyword=keyword, platform=platform, max_count=max_count,
+            output_file=output_file, stream_ctx=ctx, profile=prof, **common,
+        )
+
+    # return_exceptions=True：一条流挂了（比如 B 的代理失效）不该把另一条也拖死，
+    # 已经入库的数据仍然有效。异常在这里统一汇总打印。
+    results = await asyncio.gather(
+        *(_run_one(i, p) for i, p in enumerate(profiles)),
+        return_exceptions=True,
+    )
+
+    logger.info("")
+    logger.info("=" * 62)
+    failed = []
+    for prof, res in zip(profiles, results):
+        if isinstance(res, BaseException):
+            failed.append(prof.name)
+            logger.error(f"❌ [双浏览器] 浏览器 {prof.name} 这条流异常结束："
+                         f"{type(res).__name__}: {res}")
+        else:
+            logger.info(f"✅ [双浏览器] 浏览器 {prof.name} 这条流已结束")
+    if failed:
+        logger.warning(f"⚠️ 有 {len(failed)} 条流未正常结束（{'/'.join(failed)}）—— "
+                       f"已入库的数据不受影响，可单独重跑该流。")
     logger.info(f"💾 报表: {output_file}")
     logger.info("=" * 62)
 

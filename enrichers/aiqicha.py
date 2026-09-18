@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import random
 import re
 import time
@@ -88,6 +89,23 @@ class AiQiChaEnricher:
     # 因为弹一次码的代价（取图+识别+拖动，甚至转人工 240s）远大于多等几秒。
     CAPTCHA_COOLDOWN_AFTER_PASS = (9.0, 15.0)
     CAPTCHA_WAIT_HINT_EVERY = 20.0        # 每隔多少秒打印一次等待进度
+
+    # ── 「连环验证码」的对策（实测 2026-09-18）────────────────────────────
+    # 现象：**过码通过得较慢时，通过后立刻又弹出一个新的图形验证码**。
+    # 原因大概率是：百度把"过得慢的会话"判成高危，刚放行就再拦一次；此时继续在
+    # 同一个页面上反复过码，风控只会逐轮升级（越试越难，最后无论如何都过不去）。
+    # 对策：把这个页面**关掉重开**（换一个干净的文档 → 残留的验证码 overlay / iframe
+    # 全部消失，等于重置页内状态），再去过码。连续 CAPTCHA_REOPEN_LIMIT 次仍摆脱不掉
+    # → 转人工等待（用户口径：出现 3 次以上就交给人）。
+    # 连续出现这么多次「过码后立刻又弹新码」就**转人工等待**（用户口径）。
+    # 注意：达到这个次数时**不再自动重开**，直接交给人 —— 自动重开发生在前 (LIMIT-1) 次。
+    CAPTCHA_REOPEN_LIMIT = 3
+    CAPTCHA_CHAIN_RECHECK = (1.6, 2.6)    # 过码后"复检是否又弹新码"的等待（秒）
+    # 「识别太慢、图已被换掉」时**允许重取图片的次数**（不占用 captcha_max_attempts 配额）。
+    # 为什么要单列：那种失败不是识别错了、也不是拖错了，是**平台太慢**（云码实测 6~21s）。
+    # 若让它消耗轮次配额，等于"平台慢就让自动化白丢一次机会"，反而更容易掉到人工。
+    CAPTCHA_REFETCH_LIMIT = 3
+    AIQICHA_HOME_URL = "https://aiqicha.baidu.com/"
 
     # ── 百度安全验证（旋转验证码）选择器 ────────────────────────────────
     # 多来源交叉验证：新版用 `passMod_spin-*` 系列类名，旧版用 `vcode-spin-*` 系列 id，
@@ -470,6 +488,9 @@ class AiQiChaEnricher:
         self._solver_resolved = False
         # 过码冷却：monotonic 时间戳。0 = 不在冷却期。见 CAPTCHA_COOLDOWN_AFTER_PASS。
         self._captcha_cool_until = 0.0
+        # 「连环验证码」累计次数（跨家累计，仅用于诊断/日志；判定用的是
+        # `_resolve_chain_captcha` 里的局部计数，不受这个值影响）。
+        self._captcha_chain_count = 0
 
     # ------------------------------------------------------------------ #
     # 基础设施
@@ -747,6 +768,19 @@ class AiQiChaEnricher:
             print("      ⏭️ [爱企查] 命中验证码，captcha_mode=off：跳过该企业、不等待")
             return False
 
+        if not await self._solve_captcha_once(page, timeout=timeout):
+            return False
+        # 过码成功后**必须复检** —— 实测"过得慢"的会话会在通过后立刻又弹一个新码。
+        # 不复检的话上层会以为已放行、继续导航，然后立刻又被拦：用户看到的就是
+        # "验证码一直在刷"。详见 `_resolve_chain_captcha`。
+        return await self._resolve_chain_captcha(page, timeout=timeout)
+
+    async def _solve_captcha_once(self, page: Page, *, timeout: float) -> bool:
+        """**过码一次**：自动打码 → 失败转人工；成功则加缓和停顿 + 冷却窗口。
+
+        刻意**不含**"连环验证码"的复检（那在 `_resolve_chain_captcha` 里做）——
+        这样它既能被首次过码调用、也能被"重开页面后再过一次"复用，不会互相递归。
+        """
         if self.captcha_mode == "auto":
             if await self._auto_solve_captcha(page):
                 await self._comfort_rest("自动过码通过后的缓和停顿")
@@ -768,6 +802,106 @@ class AiQiChaEnricher:
         self.last_error = "captcha_unresolved"
         print("      ❌ [爱企查] 验证码未解决（未启用人工等待），本企业标记失败")
         return False
+
+    # ---- 「连环验证码」的处置 ------------------------------------------- #
+    async def _captcha_reappeared(self, page: Page) -> bool:
+        """过码通过后，验证码是否"又回来了"（含延迟弹出）。
+
+        先立刻查一次；没有的话再等 `CAPTCHA_CHAIN_RECHECK` 秒复查一次 —— 实测新码
+        常在一两秒后才冒出来（overlay 重新挂载），只查一次会漏，于是误判成"已放行"。
+        判定只认"**确实检测到**"（`_captcha_present`）：页面正在跳转导致的"判定不了"
+        不算，否则每次正常过码后的跳转过程都会被当成连环码。
+        """
+        if await self._captcha_present(page):
+            return True
+        await asyncio.sleep(random.uniform(*self.CAPTCHA_CHAIN_RECHECK))
+        return await self._captcha_present(page)
+
+    async def _reopen_aiqicha(self, page: Page) -> None:
+        """**把这个卡住的验证码页关掉，重新打开爱企查**。
+
+        两点说明：
+          · 验证码有时被开成**另一个标签页**（见 `_find_captcha_page`）—— 那就直接
+            关掉它，调用方的 page 不动。
+          · 验证码就长在调用方的 page 上时，用 `goto` 重载而不是 `close()` +
+            `new_page()`：`page` 是调用方持有的对象（同一个 page 上还要连着查多家），
+            换对象会把调用方的引用打断。重载到首页的效果等价 —— 新文档 = 干净的 JS
+            环境，残留的验证码 overlay / iframe 全部消失；cookie 属于 context，登录态不受影响。
+        """
+        try:
+            other = await self._find_captcha_page(page)
+            if other is not None and other is not page:
+                await other.close()
+                logger.warning("[爱企查] 连环验证码：已关闭那个独立的验证码标签页")
+        except Exception as e:
+            logger.debug(f"[爱企查] 关闭验证码标签页时异常（忽略，继续重开）: {e!r}")
+
+        # 重开前补足过码冷却：刚过完码就高频导航是最容易被再次拦下的动作。
+        await self._respect_captcha_cooldown("重开爱企查页面")
+        try:
+            await page.goto(self.AIQICHA_HOME_URL, wait_until="domcontentloaded",
+                            timeout=35000)
+            self.last_page_url = page.url
+        except Exception as e:
+            # 重开本身失败不该把流程打死：后面 `_captcha_present` 会再判一次 ——
+            # 真有码就继续解决，没码就放行。
+            logger.warning(f"[爱企查] 重开爱企查页面异常（继续尝试）: "
+                           f"{type(e).__name__}: {str(e)[:80]}")
+        await self._human_delay(1.2, 2.2)
+
+    async def _resolve_chain_captcha(self, page: Page, *, timeout: float) -> bool:
+        """过码后的复检 + 「连环验证码」处置。True=可继续；False=彻底没过（计熔断）。
+
+        流程：复检 → 又弹了就把页面关掉重开 → 重开后干净则放行；仍有码就再过一次 →
+        再复检……**连续出现 `CAPTCHA_REOPEN_LIMIT` 次**（用户口径：出现 3 次以上）
+        就转人工等待。达到上限那一次**不再自动重开**，直接交给人。
+
+        为什么不就地一直过码：过得慢的会话在风控眼里已经是高危，在同一个页面上反复
+        过码只会逐轮升级（越试越难），关掉重开反而能重置这个状态。
+        """
+        reopen = 0
+        while True:
+            if not await self._captcha_reappeared(page):
+                if reopen:
+                    logger.warning(f"[爱企查] 已摆脱连环验证码（关闭重开 {reopen} 次后恢复正常）")
+                self._captcha_chain_count = 0
+                return True
+
+            reopen += 1
+            self._captcha_chain_count += 1
+
+            if reopen >= self.CAPTCHA_REOPEN_LIMIT:
+                # 连续出现 LIMIT 次（含本次）→ 不再自动重开，交给人。
+                logger.error(
+                    f"[爱企查] 连环验证码已**连续出现 {reopen} 次**（达到上限 "
+                    f"{self.CAPTCHA_REOPEN_LIMIT}）→ 转人工等待（上限 {float(timeout or 0):.0f}s）。"
+                    f"继续自动过码只会让风控升级，所以交给人处理。"
+                )
+                if timeout and timeout > 0:
+                    if await self._manual_wait_captcha(page, timeout):
+                        await self._comfort_rest("人工过码（连环验证码后）的缓和停顿")
+                        self._arm_captcha_cooldown("人工过码")
+                        self._captcha_chain_count = 0
+                        return True
+                self.blocked = True
+                self.last_error = "captcha_chain_unresolved"
+                logger.error("[爱企查] 连环验证码：人工等待未通过或未启用 → 本家标记失败（计入熔断）")
+                return False
+
+            logger.warning(
+                f"[爱企查] 过码后又立刻弹出新验证码（连续第 {reopen} 次，上限 "
+                f"{self.CAPTCHA_REOPEN_LIMIT} 次）→ 关闭当前爱企查页面，重新打开爱企查再过码"
+            )
+            await self._reopen_aiqicha(page)
+
+            if not await self._captcha_present(page):
+                logger.warning("[爱企查] 重开爱企查页面后已无验证码，继续")
+                self._captcha_chain_count = 0
+                return True
+
+            if not await self._solve_captcha_once(page, timeout=timeout):
+                return False
+            # 回到循环顶部复检：又弹就继续重开，直到超过上限转人工。
 
     async def _manual_wait_captcha(self, page: Page, timeout: float) -> bool:
         """**暂停并等待人工过验证**（口径对齐天眼查 `_handle_captcha_if_needed`）。
@@ -892,6 +1026,28 @@ class AiQiChaEnricher:
             or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")   # WebP
             or data.startswith(b"BM")                        # BMP
         )
+
+    async def _captcha_image_signature(self, page: Page) -> str:
+        """当前验证码图片的签名（`img.src` 的哈希）。
+
+        用途：判断「**识别期间图被换掉了**」。识别要花 6~21s（实测云码旋转的耗时区间），
+        这段时间足够百度换一张图；换了还照旧拖，拖的就是**上一张图的角度** ——
+        必然失败，而且白花 2~3 秒的拖动。识别前后各取一次签名、比对即可识破。
+
+        取不到时返回空串，调用方按"判定不了"处理（**不因此作废**，保持宽松）。
+        """
+        try:
+            el = await self._find_visible(page, self.CAPTCHA_IMG_SELECTORS)
+            if el is None:
+                return ""
+            src = (await el.get_attribute("src")) or ""
+            if not src:
+                src = (await el.get_attribute("data-src")) or ""
+            if not src:
+                return ""
+            return hashlib.md5(src.encode("utf-8", "ignore")).hexdigest()[:12]
+        except Exception:
+            return ""
 
     async def _maybe_square_crop(self, page: Page, image_bytes: bytes) -> bytes:
         """按 CAPTCHA_SQUARE_CROP 决定是否把图片居中裁成正方形；失败则原样返回。
@@ -1115,8 +1271,12 @@ class AiQiChaEnricher:
                     deg_per_px = ratio
             if deg_per_px:
                 calibrated = angle / deg_per_px
-                logger.debug(f"[爱企查] 自校准: {dx:.0f}px → {rot:.1f}°（{deg_per_px:.4f}°/px），"
-                             f"目标 {angle:.1f}° → {calibrated:.0f}px（几何估算 {target:.0f}px）")
+                # 升到 info：这是判断"某一轮为什么偏"的关键数据。
+                # 实测健康值约 **1.50~1.55°/px**（360° ≈ 236px）；若打出 0.4 或 4.0 这种，
+                # 说明探针段读到了 CSS 过渡的中间态（`_slide_state` 取到瞬时值），那一轮注定偏。
+                logger.info(f"      📐 [爱企查] 自校准: {dx:.0f}px → {rot:.1f}°"
+                            f"（{deg_per_px:.3f}°/px）→ 目标 {angle:.1f}° 折算 {calibrated:.0f}px"
+                            f"（几何估算 {target:.0f}px）")
                 target = calibrated
 
         target = max(0.0, min(target, travel))
@@ -1187,25 +1347,60 @@ class AiQiChaEnricher:
 
         注意这里是**多轮尝试**而不是"同一张图重试"：百度验证失败后会刷新出
         新的验证码图片，所以每一轮都要重新取图、重新识别。
+
+        ⚠️ 识别耗时是这条链路的主要成本（云码旋转实测 **6~21s**，波动很大）。
+        耗时越长，图在识别期间被服务端换掉的概率越高 —— 那时拖的是**上一张图的角度**，
+        必然失败还白花拖动时间。所以识别前后各取一次图片签名比对，
+        不一致就**当场作废、重取**（且不消耗轮次配额，见 `CAPTCHA_REFETCH_LIMIT`）。
         """
         solver = self._get_solver()
         if solver is None:
             return False
 
-        for attempt in range(1, self.captcha_max_attempts + 1):
+        attempt = 0            # 真正**拖动过**的轮次（消耗 captcha_max_attempts 配额）
+        refetch = 0            # "识别期间图被换掉"的次数（**不消耗配额**，见 CAPTCHA_REFETCH_LIMIT）
+        while attempt < self.captcha_max_attempts:
+            attempt += 1
             try:
                 # 控件是**异步**渲染的：刚检测到就取图必然失败（真实流水线里正是这么失败的）。
                 # 这里先等它就绪；等不到也照常往下走（best effort，不制造新的失败路径）。
                 await self._wait_captcha_ready(page)
+                # 记下"识别前"的图：识别要花 6~21s（实测云码旋转耗时区间），
+                # 这段时间足够百度把图换一张。不比对就会拿**上一张图的角度**去拖当前这张图
+                # —— 必然失败，而且白花 2~3 秒的拖动。
+                sig_before = await self._captcha_image_signature(page)
                 image = await self._grab_captcha_image(page)
                 if not image:
                     print("      ⚠️ [爱企查] 取不到验证码图片"
                           "（控件未渲染完 / 在未加载的 iframe 里）→ 转人工等待")
                     return False
 
+                _t0 = time.monotonic()
                 angle = await solver.solve_rotate(image)
+                solve_cost = time.monotonic() - _t0
                 if angle is None:
                     return False
+
+                sig_after = await self._captcha_image_signature(page)
+                if sig_before and sig_after and sig_before != sig_after:
+                    # ⚠️ 本轮拿到的是**过期角度**（图在识别期间被换掉了）→ 不拖动，直接重取。
+                    #    关键：这**不算一轮**（`attempt` 退回去）—— 失败的原因是"平台慢"，
+                    #    不是"识别错/拖错"。若让它吃掉轮次配额，平台一慢就更容易掉到人工。
+                    if refetch >= self.CAPTCHA_REFETCH_LIMIT:
+                        logger.error(
+                            f"      ❌ [爱企查] 连续 {refetch} 次取到的图都在识别期间被换掉"
+                            f"（识别耗时普遍 {solve_cost:.1f}s）→ 放弃自动过码，转人工等待"
+                        )
+                        return False
+                    refetch += 1
+                    attempt -= 1
+                    logger.warning(
+                        f"      ⚠️ [爱企查] 识别耗时 {solve_cost:.1f}s，期间验证码图片**已被刷新**"
+                        f" → 本次角度作废（不拖动，避免白拖），重取图片"
+                        f"（第 {refetch}/{self.CAPTCHA_REFETCH_LIMIT} 次，不计入轮次）"
+                    )
+                    await self._human_delay(0.4, 0.9)
+                    continue
 
                 # 平台返回的是"转正所需顺时针角度"。CAPTCHA_ANGLE_SIGN=-1 时取补角
                 # （相当于反向拖动），因为滑块只能从左端往右拖。
@@ -1218,7 +1413,9 @@ class AiQiChaEnricher:
                     print("      ⚠️ [爱企查] 找不到滑块，转人工等待")
                     return False
 
-                print(f"      🤖 [爱企查] 打码识别 {angle:.1f}°，开始拖动"
+                # 把识别耗时打出来：它是"轮次"之外的另一半成本（云码实测 6~21s、波动很大），
+                # 此前只能登录打码平台后台才看得到；一轮的总耗时 ≈ 识别耗时 + 2~3s 拖动。
+                print(f"      🤖 [爱企查] 打码识别 {angle:.1f}°（耗时 {solve_cost:.1f}s），开始拖动"
                       f"（第 {attempt}/{self.captcha_max_attempts} 轮）")
                 used = await self._drag_to_angle(page, handle, angle)
                 print(f"         已拖到 {used:.0f}px（角度→像素由页面自校准）")

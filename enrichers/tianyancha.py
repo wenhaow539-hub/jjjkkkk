@@ -13,6 +13,25 @@ from utils.phone import deduplicate_phone_list
 logger = get_logger("enricher.tianyancha")
 
 
+# —— 电话提取的「安全正则」——
+# ⚠️ 旧写法 `电话\s*[:：]?\s*([+\d\s\-]+)` 有两个致命缺陷，实测污染了报表 12+ 行：
+#   ① `更多电话 3` —— "电话" 后面正好跟一个数字，被当成号码抓走；
+#      `解锁企业电话，快速定位目标企业` 同理（"电话，" 后面的空白被吞）。
+#   ② `400-6080000` —— 天眼查**自家客服热线**，页面页脚/悬浮条到处都有，
+#      落在 "电话" 字样附近就会被抓成企业号码（全表重复出现 12 次）。
+# 修法：只匹配**真实号码的形状**（手机 11 位 / 带区号座机 / 400-800 / 国际号），
+# 而不是"凡是数字横线空格都收"。收紧后 `更多电话 3`（仅 1 位数字）自然不匹配。
+SAFE_PHONE_RE = re.compile(
+    r'(?:'
+    r'\+?86[\s\-]?(?:1[3-9]\d{9}|0\d{2,3}[\s\-]?\d{7,8}|[48]00[\s\-]?\d{3}[\s\-]?\d{4})'   # 带 +86
+    r'|1[3-9]\d{9}'                                                                        # 裸手机号
+    r'|0\d{2,3}[\s\-]?\d{7,8}'                                                             # 裸座机（0755-12345678）
+    r'|[48]00[\s\-]?\d{3}[\s\-]?\d{4}'                                                     # 400/800
+    r'|\+\d{1,3}[\s\-]?\d{6,12}'                                                           # 其它国际号
+    r')'
+)
+
+
 class TianyanchaEnricher:
     # 触发风控的判定线索。天眼查的拦截页是 `tianyancha.com/sorry/captcha?from=...&token=...`，
     # 注意它**不含** "verify" 字样 —— 原实现只查 "verify"/"sec.tianyancha.com"，会漏判。
@@ -45,6 +64,20 @@ class TianyanchaEnricher:
     # 等太久会拖慢换新图的节奏（原先写死 15s，一轮白等）。
     ROUND_RELEASE_WAIT = 6.0
 
+    # —— 「连环验证码」处置（口径与爱企查对齐）—— #
+    # 现象（用户 2026-09-18 反馈）：**图形验证码通过后，紧接着又是一个图形验证码**，
+    #   需要重新点一次「开始验证」按钮才能进入点选弹窗。
+    # 根因：天眼查过码成功后不是直接放行，而是**回到拦截页 /sorry/captcha**（换了新 token），
+    #   页面停在第一段「点击按钮开始验证」。旧的 `_auto_solve_captcha` 在轮末用
+    #   `_captcha_present()` 判断"是否放行"—— 而拦截页 URL 本身就让它恒为 True，
+    #   于是要么提前 return True（其实码还在），要么把新码当成"上一轮没过"而只重试同一步。
+    # 处置：过码后**复检**是否又弹新码 → 是就把拦截页关掉重开目标页 → 干净则放行；
+    #   仍有码就再走一遍完整过码 → 再复检……**连续 CAPTCHA_CHAIN_LIMIT 次**转人工。
+    CAPTCHA_CHAIN_LIMIT = 3          # 用户口径：出现 3 次以上等待人工处理
+    CAPTCHA_CHAIN_RECHECK = (1.6, 2.6)   # 过码后"复检是否又弹码"的等待（秒）
+    # 过完码后回到的干净页面（重开用）。天眼查首页不需要登录即可访问。
+    TYC_HOME_URL = "https://www.tianyancha.com/"
+
     def __init__(self, captcha_mode: str = "auto", captcha_provider: str | None = None,
                  captcha_wait: float | None = None):
         self.search_count = 0  # 累计检索总数
@@ -64,6 +97,11 @@ class TianyanchaEnricher:
         self._solver_inited = False
         # 本次流程内是否遇到过"验证码没过去"，供 search_and_enrich 标记 blocked
         self.last_captcha_failed = False
+        # 连环验证码耗尽（连续 CAPTCHA_CHAIN_LIMIT 次仍摆脱不掉）时的失败原因。
+        # 上游 `pipeline._classify_result()` 靠 `blocked` 或 `last_error` 前缀 `captcha_`
+        # 把这种情况判成 failed（计熔断）；不设它会被误判成"查无此企业"而**重置**熔断，
+        # 风控已经升级了却当没事发生 —— 口径对齐爱企查 `captcha_chain_unresolved`。
+        self.last_captcha_error: str = ""
 
         # 拟人鼠标：记录我们**自己**上次把鼠标移到哪，作为下一次轨迹的起点。
         # （只记自己的移动；用户手动挪过鼠标我们不知道，但起点的少量偏差不影响真实性）
@@ -798,6 +836,9 @@ class TianyanchaEnricher:
           原本担心打码员理解不了这种非文字提示 —— **实测能正确理解**，3 个坐标全中。
         · 通过后**自动回跳**到 `from` 指定的原页面，所以调用方不需要重新 goto，
           后续 `wait_for_selector('table...')` 可以直接等工商表格加载。
+          ⚠️ **但不总是如此**（2026-09-18 用户反馈）：有时通过后**又弹一个新码**，
+          页面停在拦截 URL 上（第一段「点击按钮开始验证」）。那时不能当作已放行，
+          必须由 `_resolve_chain_captcha` 复检并处置 —— 见 `_auto_solve_captcha`。
         · 截图尺寸与容器尺寸可能差 1px（341 vs 340），所以坐标换算必须用
           **真实图片宽高**（`_png_size`），不能假设等于容器尺寸。
 
@@ -813,74 +854,12 @@ class TianyanchaEnricher:
               ③ 交互前 `bring_to_front()`（后台标签页里极验可能不渲染控件）；
               ④ 失败时把现场落盘（截图 + DOM 摘要 + 逐 frame 扫描）。
         """
-        solver = self._get_solver()
-        if solver is None:
+        # 主体逻辑已在 `_solve_captcha_once`（连环验证码重开后再过一次要复用它，
+        # 抽出去避免复制两份）。这里只负责：走过码 → **复检是否又弹新码** → 连环处置。
+        if not await self._solve_captcha_once(page):
             return False
-
-        try:
-            # ⓪ 极验在**后台标签页**里可能不渲染控件（它读 document.visibilityState）。
-            #    流水线本就是无人值守运行，把页面提到前台是安全且必要的。
-            try:
-                await page.bring_to_front()
-            except Exception:
-                pass
-
-            # ① 等极验渲染出来，判断当前处于哪一段。
-            #    **不能"查一次就决定"**：URL 命中 /sorry/captcha 时 JS 常常还没跑完，
-            #    那一刻按钮、提示文案都还不存在（实测踩到的正是这个时序）。
-            stage = await self._wait_geetest_stage(page, timeout=self.STAGE_WAIT_FIRST)
-
-            if stage == "button":
-                if not await self._click_start_button(page):
-                    await self._dump_captcha_forensics(page, "start_button_not_found")
-                    return False
-                stage = await self._wait_geetest_stage(page, timeout=self.STAGE_WAIT_SECOND)   # 等第二段弹窗
-
-            if stage != "point":
-                why = {
-                    "button": "按钮点了但第二段弹窗没出现",
-                    "slider": "滑块类型（本项目只接了点选，未接滑块）",
-                    "": "极验控件始终没渲染出来",
-                }.get(stage, stage)
-                print(f"      ⚠️ [天眼查] 点选弹窗未就绪 —— {why}，转人工")
-                await self._dump_captcha_forensics(page, f"no_point_modal_{stage or 'unknown'}")
-                return False
-
-            await asyncio.sleep(random.uniform(0.6, 1.2))   # 等图形区渲染完
-
-            # ③~⑦ 多轮尝试。**每轮都重新截图**：验证失败后极验会换一张新图和一组
-            # 新提示，拿旧图重算等于把同一个错误再做一遍。
-            # （原先只有一轮，失败即转人工 —— 实测踩到：提示 3 个图标、云码只返回 2 个点，
-            #   当轮必失败，而换图重来一次就过了。）
-            last_info: dict = {}
-            for rnd in range(1, self.CAPTCHA_MAX_ROUNDS + 1):
-                # 上一轮可能其实已放行，只是判定慢半拍
-                if not await self._captcha_present(page):
-                    return True
-                ok, info = await self._solve_point_round(page, solver, rnd, self.CAPTCHA_MAX_ROUNDS)
-                if ok:
-                    return True
-                last_info = info
-                if rnd < self.CAPTCHA_MAX_ROUNDS:
-                    print(f"      ↻ [天眼查] 第 {rnd} 轮未通过"
-                          f"（{info.get('reason') or '未放行'}），换新图重试")
-                    await self._reset_point_modal(page)
-                    await self._human_rest(1.2, 2.4, desc="换新图前停顿")
-
-            await self._dump_captcha_forensics(
-                page, f"point_failed_{last_info.get('reason') or 'unknown'}",
-                extra_png=last_info.get("png"), extra_name="last_round_captcha.png")
-            print(f"      ⚠️ [天眼查] {self.CAPTCHA_MAX_ROUNDS} 轮均未通过"
-                  f"（最后一轮：提示条 {last_info.get('hint_icons') or '?'} 个图标 / "
-                  f"平台返回 {last_info.get('points') or 0} 个点；现场已落盘）")
-            return False
-
-        except CaptchaProviderError as e:
-            print(f"      ⚠️ [天眼查] 打码平台错误: {e}")
-            return False
-        except Exception as e:
-            print(f"      ⚠️ [天眼查] 自动过码异常: {type(e).__name__}: {e}")
-            return False
+        # ⭐ 过码≠放行：天眼查成功后常立刻又弹一个新码（详见 _resolve_chain_captcha）。
+        return await self._resolve_chain_captcha(page)
 
     async def _solve_point_round(self, page, solver, rnd: int, total: int) -> tuple[bool, dict]:
         """跑一轮：定位弹窗 → 截图 → 打码 → 依次点击 → 点确定 → 等放行。
@@ -997,6 +976,131 @@ class TianyanchaEnricher:
             except Exception:
                 continue
         return False
+
+    # ------------------------------------------------------------------ #
+    # 「连环验证码」处置（2026-09-18 用户口径）
+    # ------------------------------------------------------------------ #
+    async def _captcha_reappeared(self, page) -> bool:
+        """过码通过后，验证码是否"又回来了"（含延迟弹出）。
+
+        先立刻查一次；没有的话再等 `CAPTCHA_CHAIN_RECHECK` 秒复查一次 —— 实测新码
+        常在一两秒后才冒出来（拦截页重新挂载），只查一次会漏，于是误判成"已放行"。
+
+        ⚠️ 与爱企查不同的是：天眼查的验证码**本身就是个 URL 页面**（/sorry/captcha），
+        `_captcha_present()` 靠 URL 命中就为真。所以过码后若页面还停在拦截 URL 上，
+        一定是有新码（正常放行会回跳到目标页）。这也正是旧实现误判的根源。
+        """
+        if await self._captcha_present(page):
+            return True
+        await asyncio.sleep(random.uniform(*self.CAPTCHA_CHAIN_RECHECK))
+        return await self._captcha_present(page)
+
+    async def _reopen_tianyancha(self, page) -> None:
+        """关掉卡住的拦截页，重新打开天眼查首页（干净 JS 环境，残留 overlay 全消失）。
+
+        用 `goto` 而不是 `close()+new_page()`：`page` 是调用方持有的对象
+        （同一个 page 上还要连着查多家），换对象会打断调用方的引用。
+        cookie 属于 context，登录态不受影响。
+        """
+        await self._human_rest(1.2, 2.2, desc="重开天眼查页面前停顿")
+        try:
+            await page.goto(self.TYC_HOME_URL, wait_until="domcontentloaded", timeout=35000)
+        except Exception as e:
+            # 重开本身失败不该把流程打死：后面 `_captcha_present` 会再判一次 ——
+            # 真有码就继续解决，没码就放行。
+            print(f"      ⚠️ [天眼查] 重开页面异常（继续尝试）: {type(e).__name__}: {str(e)[:80]}")
+
+    async def _resolve_chain_captcha(self, page) -> bool:
+        """过码后的复检 + 「连环验证码」处置。True=可继续；False=彻底没过（计熔断）。
+
+        用户口径（2026-09-18）：
+        「图形验证码通过后，紧接着又是一个图形验证码，需要重新单击图标再进入图形验证码
+          → 遇到这种情况就关掉当前页面重开；**出现 3 次以上等待人工处理**」
+
+        流程：复检 → 又弹了就把拦截页关掉重开 → 重开后干净则放行；仍有码就再走一遍
+        完整过码 → 再复检……连续出现 `CAPTCHA_CHAIN_LIMIT` 次就转人工等待。
+        达到上限那一次**不再自动重开**，直接交给人 —— 继续自动过码只会让风控升级。
+        """
+        chain = 0
+        while True:
+            if not await self._captcha_reappeared(page):
+                if chain:
+                    print(f"      ✅ [天眼查] 已摆脱连环验证码（关闭重开 {chain} 次后恢复正常）")
+                return True
+
+            chain += 1
+            if chain >= self.CAPTCHA_CHAIN_LIMIT:
+                wait = self._resolve_wait()
+                print(f"\n      🛑 [天眼查] 连环验证码已**连续出现 {chain} 次**"
+                      f"（达到上限 {self.CAPTCHA_CHAIN_LIMIT}）")
+                print(f"         继续自动过码只会让风控升级，转人工等待"
+                      f"（上限 {wait:.0f}s；用 --captcha-mode off 可跳过不等待）")
+                if wait > 0 and await self._manual_wait_captcha(page):
+                    return True
+                self.last_captcha_failed = True
+                self.last_captcha_error = "captcha_chain_unresolved"
+                return False
+
+            print(f"      ↻ [天眼查] 过码后又立刻弹出新验证码（连续第 {chain} 次，"
+                  f"上限 {self.CAPTCHA_CHAIN_LIMIT} 次）→ 关闭当前页面，重开天眼查再过码")
+            await self._reopen_tianyancha(page)
+
+            if not await self._captcha_present(page):
+                print("      ✅ [天眼查] 重开页面后已无验证码，继续")
+                return True
+
+            # 重开后仍被拦 → 完整走一遍过码（点开始按钮 → 点选）
+            if not await self._solve_captcha_once(page):
+                return False
+            # 回到循环顶部复检：又弹就继续重开，直到超过上限转人工。
+
+    async def _solve_captcha_once(self, page) -> bool:
+        """走**一遍**完整的自动过码（点开始按钮 → 点选 → 验证）。
+
+        从 `_auto_solve_captcha` 的正文抽出，供连环验证码重开后再过一次复用 ——
+        否则那段逻辑要么重复复制一份，要么得靠递归调用（递归会在连环码时越套越深）。
+        """
+        solver = self._get_solver()
+        if solver is None:
+            return False
+        try:
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
+            stage = await self._wait_geetest_stage(page, timeout=self.STAGE_WAIT_FIRST)
+            if stage == "button":
+                if not await self._click_start_button(page):
+                    await self._dump_captcha_forensics(page, "start_button_not_found")
+                    return False
+                stage = await self._wait_geetest_stage(page, timeout=self.STAGE_WAIT_SECOND)
+            if stage != "point":
+                await self._dump_captcha_forensics(page, f"chain_no_point_modal_{stage or 'unknown'}")
+                return False
+            await asyncio.sleep(random.uniform(0.6, 1.2))
+            last_info: dict = {}
+            for rnd in range(1, self.CAPTCHA_MAX_ROUNDS + 1):
+                if not await self._captcha_present(page):
+                    return True
+                ok, last_info = await self._solve_point_round(page, solver, rnd, self.CAPTCHA_MAX_ROUNDS)
+                if ok:
+                    return True
+                if rnd < self.CAPTCHA_MAX_ROUNDS:
+                    await self._reset_point_modal(page)
+                    await self._human_rest(1.2, 2.4, desc="换新图前停顿")
+            # ⚠️ 全部轮次失败也要留现场 —— 且**带上这一轮裁好的验证码图**，
+            #    否则事后无法判断"到底是漏点还是提示本来就少"。抽 _solve_captcha_once
+            #    时漏掉过这一步，被 P4b/P4c 回归测到。
+            await self._dump_captcha_forensics(
+                page, f"point_failed_{last_info.get('reason') or 'unknown'}",
+                extra_png=last_info.get("png"), extra_name="captcha_last.png")
+            return False
+        except CaptchaProviderError as e:
+            print(f"      ⚠️ [天眼查] 打码平台错误: {e}")
+            return False
+        except Exception as e:
+            print(f"      ⚠️ [天眼查] 自动过码异常: {type(e).__name__}: {e}")
+            return False
 
     def _clean_capital(self, val: str) -> str:
         """金额提纯：提取规范金额及币种"""
@@ -1133,6 +1237,12 @@ class TianyanchaEnricher:
             "blocked": False,
             "last_error": "",
         }
+        # 每次检索开始清掉上一家的验证码失败标记：这是**实例级**状态，不重置的话
+        # 上一家的 `captcha_chain_unresolved` 会盖到这一家头上（误报 + 诊断串味）。
+        # ⚠️ 必须放在下面的早退**之前** —— 早退路径同样不该带着上一家的标记返回。
+        self.last_captcha_error = ""
+        self.last_captcha_failed = False
+
         if not company_name or len(company_name.strip()) < 3:
             return info
 
@@ -1160,7 +1270,9 @@ class TianyanchaEnricher:
                 # 判成 not_found（"站内查无此企业"），而今天加的
                 # 「工商字段全空则不入库」会据此**删掉本来只是被风控拦住的正常商户**。
                 info["blocked"] = True
-                info["last_error"] = "captcha_not_passed"
+                # 连环验证码耗尽要单独标出来（`captcha_chain_unresolved`），
+                # 别和普通"过码没过"混成一条 —— 前者说明风控已升级，值得单独统计/调参。
+                info["last_error"] = self.last_captcha_error or "captcha_not_passed"
                 return info
             await page.mouse.wheel(0, random.randint(200, 450))
             await self._human_rest(2.0, 3.5, desc="卡片初筛")
@@ -1210,7 +1322,7 @@ class TianyanchaEnricher:
                 info["registered_capital"] = self._clean_capital(cap_m.group(1))
 
             collected_phones = []
-            for pm in re.findall(r'电话\s*[:：]?\s*([+\d\s\-]+)', card_text):
+            for pm in re.findall(SAFE_PHONE_RE, card_text):
                 if "暂无" not in pm and "登录" not in pm and len(re.sub(r'\D', '', pm)) >= 7:
                     collected_phones.append(pm.strip())
 
@@ -1326,7 +1438,12 @@ class TianyanchaEnricher:
 
                     if not collected_phones:
                         detail_text = await page.evaluate("document.body.innerText")
-                        for dp in re.findall(r'(?:电话|联系方式)\s*[:：]?\s*([+\d\s\-]+)', detail_text):
+                        # 同卡片口径：用 SAFE_PHONE_RE 只收真实号码形状，
+                        # 不再用 `(?:电话|联系方式)\s*[:：]?\s*([+\d\s\-]+)`（会把
+                        # `更多电话 3`、天眼查客服热线 400-6080000 一起抓进来）。
+                        # 详情页正文里号码总是独立出现（含 +86 前缀或裸 11 位），
+                        # 不需要靠 "电话:" 标签定位。
+                        for dp in SAFE_PHONE_RE.findall(detail_text):
                             if "暂无" not in dp and "登录" not in dp and len(re.sub(r'\D', '', dp)) >= 7:
                                 collected_phones.append(dp.strip())
 

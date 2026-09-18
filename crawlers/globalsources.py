@@ -8,6 +8,13 @@ from playwright.async_api import async_playwright
 
 import config
 from core.base_crawler import BaseCrawler
+from utils.logger import get_logger
+
+# GS 的输出量很大且与另一条流交错，必须走统一日志器：
+# 双流时才会带上 [A]/[B] 前缀（单流输出与改造前逐字节一致），
+# 而且会写进 logs/pipeline_YYYYMMDD.log —— print 是拿不到这两样的，
+# 上一次排查「浏览器中途退出」时就是因为关键行只在 print 里、事后查不到。
+logger = get_logger("globalsources")
 from core.factory import CrawlerFactory
 from models import RawSupplierLead
 from utils.dedup import dedup
@@ -55,8 +62,12 @@ class GlobalSources(BaseCrawler):
         ".php", ".asp", ".aspx", ".jsp", ".html", ".htm",
     )
 
-    # 搜索列表最多翻到第几页（原先是 scrape() 里的局部变量，提到类常量做单一出处）
-    MAX_SEARCH_PAGES = 25
+    # 搜索列表最多翻到第几页（原先是 scrape() 里的局部变量，提到类常量做单一出处）。
+    # ⚠️ 走 config（`.env` 的 `GS_MAX_SEARCH_PAGES`，默认 100）。
+    #    曾经写死 25：实测 `phone + 广东` 在 GS 上有 **62 页**，于是 26 页往后**永远扫不到**，
+    #    表现为"候选入库 +0 家"→ 被判「连续零新增、池子枯竭」→ 提前退出。
+    #    详见 config.py 里 `GS_MAX_SEARCH_PAGES` 的说明。
+    MAX_SEARCH_PAGES = config.GS_MAX_SEARCH_PAGES
 
     # ---- 跨批翻页进度 ----
     # 分批跑时每批都从 pageNum=1 重扫：已进指纹库的家会被 `dedup.is_seen` 跳过，
@@ -68,8 +79,17 @@ class GlobalSources(BaseCrawler):
     #
     # ⚠️ 只在**进程内**记忆（实例属性），不落盘。跨运行"静默从中间开始采"很难解释，
     #    真需要重扫全部时用 `--reset-pages`。
-    def __init__(self, cdp_port: int = 9222, concurrency: int = 4):
-        super().__init__(cdp_port=cdp_port, concurrency=concurrency)
+    def __init__(self, cdp_port: int = 9222, concurrency: int = 4,
+                 profile_dir: str = "./chrome_debug_profile",
+                 proxy: str | None = None,
+                 reuse_nearby: bool = True,
+                 stream_tag: str = "A",
+                 lane_offset: int = 1,
+                 lane_stride: int = 1):
+        super().__init__(cdp_port=cdp_port, concurrency=concurrency,
+                         profile_dir=profile_dir, proxy=proxy,
+                         reuse_nearby=reuse_nearby, stream_tag=stream_tag,
+                         lane_offset=lane_offset, lane_stride=lane_stride)
         self._page_cursor: dict[str, int] = {}
 
     def _cursor_key(self, clean_kw: str, year_in_business: str, supplier_location: str) -> str:
@@ -78,11 +98,18 @@ class GlobalSources(BaseCrawler):
                 f"{year_in_business or '-'}|{supplier_location or '-'}")
 
     def _cursor_get(self, key: str) -> int:
-        """本批的起始页（1 = 从第一页开始）。"""
+        """本批的起始页。
+
+        默认从 `lane_offset` 起步（单流 = 1，与改造前一致）。
+        双浏览器时两条流各自一套 crawler 实例：A 的 offset=1/stride=2 → 扫 1,3,5…，
+        B 的 offset=2/stride=2 → 扫 2,4,6…，**同一关键词下两条流扫的页不相交**，
+        否则两个浏览器会把同样的列表页各扫一遍（指纹去重能挡住重复入库，但白跑一遍）。
+        """
         try:
-            return max(1, int(self._page_cursor.get(key, 1) or 1))
+            return max(self.lane_offset,
+                       int(self._page_cursor.get(key, self.lane_offset) or self.lane_offset))
         except (TypeError, ValueError):
-            return 1
+            return self.lane_offset
 
     def _cursor_put(self, key: str, page_num: int) -> None:
         """记录进度。
@@ -450,7 +477,7 @@ class GlobalSources(BaseCrawler):
         seen_companies = set()
 
         async with async_playwright() as p:
-            print(f"🔌 [{self.platform_name}] 接入 Chrome (CDP 端口: {self.cdp_port})...")
+            logger.info(f"🔌 [{self.platform_name}] 接入 Chrome (CDP 端口: {self.cdp_port})...")
             browser = await p.chromium.connect_over_cdp(f"http://127.0.0.1:{self.cdp_port}")
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
 
@@ -468,18 +495,28 @@ class GlobalSources(BaseCrawler):
 
             # —— 承接上批的翻页进度 ——
             ckey = self._cursor_key(clean_kw, year_in_business, supplier_location)
+            _has_cursor = ckey in self._page_cursor
             page_num = self._cursor_get(ckey)
             max_search_pages = self.MAX_SEARCH_PAGES
             if page_num > max_search_pages:
-                print(f"⚠️ [{self.platform_name}] 该关键词/地区下已翻到翻页上限"
-                      f"（第 {max_search_pages} 页），没有更多可扫的页 → 本批 0 家")
+                logger.warning(f"⚠️ [{self.platform_name}] 该关键词/地区下已翻到翻页上限"                      f"（第 {max_search_pages} 页），没有更多可扫的页 → 本批 0 家")
                 # ⚠️ 不在这里 `return []`：那会跳过下面的收尾（关标签页）。
                 # 把上界压到当前页之下，让 while 条件直接不成立，统一走收尾流程。
                 # 游标仍会被记成 MAX+1，下次进来还是走这个分支，行为不变。
                 max_search_pages = page_num - 1
-            if page_num > 1:
-                print(f"📑 [{self.platform_name}] 承接上批翻页进度：从第 {page_num} 页继续"
-                      f"（第 1~{page_num - 1} 页已扫过，不再重扫；要重扫请加 --reset-pages）")
+            if self.lane_stride > 1:
+                # 双浏览器：本实例只负责其中一条车道。
+                # ⚠️ 措辞要区分「承接上批进度」与「本车道的第一页」——
+                #    后者（B 首次跑、offset=2）若也写成"承接进度：第 1~1 页已扫过"，
+                #    会让人以为漏扫了第 1 页；其实第 1 页归 A 的车道，由 A 去扫。
+                if _has_cursor:
+                    logger.info(f"📑 [{self.platform_name}] 承接上批翻页进度：本车道（步长 {self.lane_stride}）"                          f"从第 {page_num} 页继续")
+                else:
+                    logger.info(f"📑 [{self.platform_name}] 本车道起始第 {page_num} 页"                          f"（步长 {self.lane_stride}：扫第 {page_num}、"
+                          f"{page_num + self.lane_stride}、{page_num + self.lane_stride * 2}… 页；"
+                          f"其余页由另一台浏览器负责）")
+            elif _has_cursor and page_num > 1:
+                logger.info(f"📑 [{self.platform_name}] 承接上批翻页进度：从第 {page_num} 页继续"                      f"（第 1~{page_num - 1} 页已扫过，不再重扫；要重扫请加 --reset-pages）")
 
             while len(candidate_sellers) < max_count and page_num <= max_search_pages:
                 query_parts = [
@@ -492,13 +529,12 @@ class GlobalSources(BaseCrawler):
                     query_parts.append(f"sls={supplier_location}")
 
                 search_url = f"https://www.globalsources.com/searchList/suppliers?{'&'.join(query_parts)}"
-                print(f"📑 [{self.platform_name}] 检索第 {page_num} 页: {search_url}")
-
+                logger.info(f"📑 [{self.platform_name}] 检索第 {page_num} 页: {search_url}")
                 try:
                     await page.goto(search_url, wait_until="domcontentloaded", timeout=35000)
                     await self.human_delay(2.0, 3.0, desc=f"第 {page_num} 页就绪")
                 except Exception as e:
-                    print(f"⚠️ 第 {page_num} 页加载超时: {e}")
+                    logger.warning(f"⚠️ 第 {page_num} 页加载超时: {e}")
                     break
 
                 for _ in range(3):
@@ -509,6 +545,13 @@ class GlobalSources(BaseCrawler):
                     'a[href*="manufacturer.globalsources.com/homepage_"], a[href*="/si/"], a.company-name, a.supplier-name'
                 )
                 if not candidate_elements:
+                    # 空页 = 这一页一张候选卡片都没有。可能是"真到底了"，**也可能是渲染失败**。
+                    # ⚠️ 所以游标**不前进**（见循环后的 `_cursor_put(ckey, page_num)`）：
+                    #    下一批会重试这一页。宁可多扫一页，也不赌"到底了"而永久漏掉它。
+                    #    注意区分：卡片都在、只是被判为"已见过"时不会走到这里
+                    #    （那种情况会打 `候选入库: +0 家` 但卡片仍在）。
+                    logger.info(f"📄 [{self.platform_name}] 第 {page_num} 页没有候选卡片"
+                                f"（可能已翻到底，也可能是渲染失败）→ 停在本页，下一批重试")
                     break
 
                 page_added = 0
@@ -569,16 +612,18 @@ class GlobalSources(BaseCrawler):
                         })
                         page_added += 1
 
-                print(f"✅ [{self.platform_name}] 候选入库: +{page_added} 家 (当前累计: {len(candidate_sellers)}/{max_count})")
+                logger.info(f"✅ [{self.platform_name}] 候选入库: +{page_added} 家 (当前累计: {len(candidate_sellers)}/{max_count})")
                 if len(candidate_sellers) < max_count:
-                    page_num += 1
+                    # 按车道步长前进（单流 stride=1 → 与改造前一致；双流 stride=2 → 隔页扫）
+                    page_num += self.lane_stride
                     await self.human_delay(1.5, 2.5, desc="翻页冷却")
 
             # 记录翻页进度：`page_num` 停在「还没吃干净的那一页」
-            # （命中 max_count 时内层 break 提前退出，第 492 行的自增不会执行）
+            # （命中 max_count 时内层 break 提前退出，上面的自增不会执行）
+            # ⚠️ 扫到空页时也记**当前页**（不记 MAX+1）：空页可能只是渲染失败，
+            #    记成"到底了"会让这一页被永久跳过。多扫一次的代价 << 漏采的风险。
             self._cursor_put(ckey, page_num)
-            print(f"📑 [{self.platform_name}] 翻页进度已记：下一批从第 "
-                  f"{self._cursor_get(ckey)} 页继续（本批结束于第 {page_num} 页）")
+            logger.info(f"📑 [{self.platform_name}] 翻页进度已记：下一批从第 "                  f"{self._cursor_get(ckey)} 页继续（本批结束于第 {page_num} 页）")
 
             # ⚠️ 必须按域名过滤：`context.cookies()` 不带参数会返回**浏览器里所有域**的 cookie。
             # 实测本机该浏览器累积了 276 条（globalsources / alibaba / aiqicha / tianyancha / baidu / qcc …），
@@ -617,9 +662,8 @@ class GlobalSources(BaseCrawler):
 
         # 把限速参数一并打出来。这一阶段看起来"卡住"时，原因几乎总是**全局限速器串行**，
         # 而不是"异步失效"（实测 12 请求 / 并发 4 → 12.6s，均值 1.14s/请求）。
-        print(f"🚀 [{self.platform_name}] 启动 HTTPX 异步提取 {len(candidate_sellers)} 家商户工商与独立站...")
-        print(f"      ⏳ {config.detail_rate_status()}"
-              f"；每家约 3~4 个请求 → 本阶段预计 "
+        logger.info(f"🚀 [{self.platform_name}] 启动 HTTPX 异步提取 {len(candidate_sellers)} 家商户工商与独立站...")
+        logger.info(f"      ⏳ {config.detail_rate_status()}"              f"；每家约 3~4 个请求 → 本阶段预计 "
               f"{len(candidate_sellers) * 3.5 * config.DETAIL_RATE_MIN_INTERVAL / 60:.1f} 分钟量级")
         semaphore = asyncio.Semaphore(self.concurrency)
         custom_headers = {
@@ -662,7 +706,7 @@ class GlobalSources(BaseCrawler):
             # 复用同一个 client：cookie/UA 都已就绪，不必为了重试再开一次浏览器。
             missing_idx = [i for i, ld in enumerate(leads) if not (ld.registered_company or "").strip()]
             if missing_idx:
-                print(f"🔁 [{self.platform_name}] {len(missing_idx)} 家未取到中文工商名，同轮内立即重爬一次...")
+                logger.info(f"🔁 [{self.platform_name}] {len(missing_idx)} 家未取到中文工商名，同轮内立即重爬一次...")
                 await self.human_delay(*NAME_RETRY_COOLDOWN, desc="重爬冷却")
 
                 async def _retry_one(i: int):
@@ -685,7 +729,7 @@ class GlobalSources(BaseCrawler):
                     dedup.add(name)
                     recovered += 1
 
-                print(f"      ↳ 重爬补回中文工商名 {recovered}/{len(missing_idx)} 家")
+                logger.info(f"      ↳ 重爬补回中文工商名 {recovered}/{len(missing_idx)} 家")
                 if recovered < len(missing_idx):
                     logger.warning(
                         f"⚠️ [GS] 重爬后仍有 {len(missing_idx) - recovered} 家无中文工商名，将按策略剔除（不入库）。"
@@ -697,8 +741,7 @@ class GlobalSources(BaseCrawler):
         # 之前这一层完全没有汇总，字段空着也看不出是解析问题还是抓取被拒。
         site_ok = sum(1 for lead in leads if (lead.official_website or "").strip())
         name_ok = sum(1 for lead in leads if (lead.registered_company or "").strip())
-        print(f"📊 [{self.platform_name}] 详情提取完成: {len(leads)} 家 | "
-              f"工商全称 {name_ok}/{len(leads)} | 独立站 {site_ok}/{len(leads)}")
+        logger.info(f"📊 [{self.platform_name}] 详情提取完成: {len(leads)} 家 | "              f"工商全称 {name_ok}/{len(leads)} | 独立站 {site_ok}/{len(leads)}")
         if name_ok == 0 and leads:
             logger.warning(
                 "⚠️ [GS] 本批详情页全部没有取到工商全称，通常意味着详情请求被拒（403/429）或超时；"
